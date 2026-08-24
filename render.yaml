@@ -1,0 +1,45 @@
+services:
+  - type: web
+    name: omniflow-control-plane
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: >-
+      python -m pip install --upgrade pip &&
+      python -m pip install -r requirements.txt &&
+      python -m compileall -q src app.py &&
+      python test_control_plane_http_api.py &&
+      python test_customer_auth_http_api.py
+    startCommand: >-
+      gunicorn app:application
+      --bind 0.0.0.0:$PORT
+      --worker-class gthread
+      --workers 1
+      --threads 4
+      --timeout 30
+      --graceful-timeout 15
+      --keep-alive 5
+      --access-logfile -
+      --error-logfile -
+      --capture-output
+    healthCheckPath: /api/v1/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.14
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PGSSLMODE
+        value: require
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_HOST
+        sync: false
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASSWORD
+        sync: false
+      - key: OMNIFLOW_ADMIN_API_KEY
+        sync: false
