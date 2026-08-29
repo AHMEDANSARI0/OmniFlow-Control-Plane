@@ -15,6 +15,8 @@ if str(SRC_DIR) not in sys.path:
 os.environ.setdefault("PGSSLMODE", "require")
 
 from control_plane.http_api import create_control_plane_api  # noqa: E402
+from auth_password_reset import bp as auth_password_reset_bp
+from admin_users import bp as admin_users_bp
 
 
 application = create_control_plane_api()
