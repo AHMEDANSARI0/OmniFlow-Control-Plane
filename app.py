@@ -22,3 +22,7 @@ from admin_users import bp as admin_users_bp
 application = create_control_plane_api()
 application.register_blueprint(auth_password_reset_bp)
 application.register_blueprint(admin_users_bp)
+
+# Vercel discovers Flask applications through a top-level variable named
+# ``app``.  Keep ``application`` for the existing Gunicorn entry point.
+app = application
