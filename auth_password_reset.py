@@ -1,42 +1,52 @@
 """
-OmniFlow Control Plane — password reset endpoints (v2, schema: platform_users +
-user_password_credentials). Registers as a Flask blueprint.
+OmniFlow Control Plane — customer password reset (self-service).
 
-Endpoints:
-  POST /api/v1/auth/forgot-password   {email}
-  POST /api/v1/auth/reset-password    {code, new_password}
+Endpoints (extension app — dispatched by app.py):
+  POST /api/v1/auth/forgot-password  {email} -> {"ok": true, "delivered": bool}
+  POST /api/v1/auth/reset-password   {code, password} -> {"ok": true}
+
+Design:
+  - 6-digit code, SHA-256 stored (password_reset_tokens, migration 007).
+    The plain code is NEVER persisted.
+  - TTL 10 minutes, single use (used_at), attempts cap 3.
+  - No user enumeration: forgot-password always answers ok:true.
+  - SMTP configured -> code is mailed (delivered:true). Otherwise the code is
+    logged (Vercel runtime logs) AND surfaced to the admin dashboard via
+    recent_reset_codes() (consumed by admin_users.reset-codes endpoint).
 """
 
-import hashlib
 import logging
 import os
 import secrets
 import smtplib
+import threading
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 from flask import Blueprint, jsonify, request
 from werkzeug.security import generate_password_hash
 
-logger = logging.getLogger("omniflow.auth-reset")
+
+logger = logging.getLogger("omniflow.auth-password-reset")
 
 bp = Blueprint("auth_password_reset", __name__, url_prefix="/api/v1/auth")
 
-# --- Schema (matches verified Neon tables; override via env if they change) ---
-USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
-USER_ID_COL = "id"
-USER_EMAIL_COL = "email"
-CREDS_TABLE = os.environ.get("OF_CREDS_TABLE", "user_password_credentials")
-CREDS_USER_COL = "user_id"
-CREDS_PASSWORD_COL = "password_hash"
-# ----------------------------------------------------------------------------
+CODE_TTL_MINUTES = 10
+CODE_MAX_ATTEMPTS = 3
+CODE_LENGTH = 6
 
-RESET_TTL_MINUTES = int(os.environ.get("OF_RESET_TTL_MINUTES", "10"))
-MAX_ATTEMPTS = 3
+USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
+USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
+TOKENS_TABLE = os.environ.get("OF_TOKENS_TABLE", "password_reset_tokens")
+CREDS_TABLE = os.environ.get("OF_CREDS_TABLE", "user_password_credentials")
+
+# TEST-PHASE: per-instance mirror of undelivered codes for the admin dashboard.
+_RECENT_LOCK = threading.Lock()
+_RECENT_CODES = []
+_RECENT_CAP = 50
 
 
 def _q(ident: str) -> str:
-    """Quote a dynamic identifier (config values, not user input)."""
     return '"' + ident.replace('"', '""') + '"'
 
 
@@ -54,164 +64,201 @@ def _conn():
     )
 
 
-def _send_code_email(to_email: str, code: str, ttl_minutes: int) -> bool:
-    host = os.environ.get("SMTP_HOST")
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _generate_code() -> str:
+    return "".join(secrets.choice("0123456789") for _ in range(CODE_LENGTH))
+
+
+def _code_hash(code: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(code.encode("utf-8")).hexdigest()
+
+
+def _smtp_configured() -> bool:
+    return bool(os.environ.get("SMTP_HOST", "").strip())
+
+
+def _send_email(to_address: str, code: str) -> bool:
+    """Best-effort code delivery. False = code stays in logs/admin panel."""
+    host = os.environ.get("SMTP_HOST", "").strip()
     if not host:
         return False
-    user = os.environ.get("SMTP_USER", "")
-    password = os.environ.get("SMTP_PASSWORD", "")
-    sender = os.environ.get("SMTP_FROM", user)
-
-    msg = EmailMessage()
-    msg["Subject"] = f"OmniFlow password reset code: {code}"
-    msg["From"] = sender
-    msg["To"] = to_email
-    msg.set_content(
-        f"Your OmniFlow password reset code is: {code}\n"
-        f"It expires in {ttl_minutes} minutes. Enter it at "
-        f"https://omniflow-bice.vercel.app/dashboard/reset-password"
-    )
-
     try:
-        with smtplib.SMTP(host, int(os.environ.get("SMTP_PORT", "587")), timeout=15) as smtp:
-            smtp.starttls()
+        msg = EmailMessage()
+        msg["Subject"] = "OmniFlow password reset code"
+        msg["From"] = os.environ.get("SMTP_FROM", "OmniFlow <no-reply@omniflow.app>")
+        msg["To"] = to_address
+        msg.set_content(
+            "Your OmniFlow password reset code is: " + code + "\n\n"
+            "Ye code " + str(CODE_TTL_MINUTES) + " minutes ke liye valid hai.\n"
+            "Agar aapne ye request nahi ki, is email ko ignore karein."
+        )
+        port = int(os.environ.get("SMTP_PORT", "587"))
+        with smtplib.SMTP(host, port, timeout=15) as server:
+            server.starttls()
+            user = os.environ.get("SMTP_USER", "").strip()
+            password = os.environ.get("SMTP_PASSWORD", "")
             if user:
-                smtp.login(user, password)
-            smtp.send_message(msg)
+                server.login(user, password)
+            server.send_message(msg)
         return True
     except Exception:
-        logger.exception("SMTP send failed; falling back to log delivery")
+        logger.exception("reset code email delivery failed")
         return False
+
+
+def recent_reset_codes():
+    """TEST-PHASE: undelivered codes for the admin dashboard (this instance)."""
+    with _RECENT_LOCK:
+        return [dict(item) for item in _RECENT_CODES]
+
+
+def _remember_code(user_id, email, code, expires_at):
+    created = _utcnow()
+    with _RECENT_LOCK:
+        _RECENT_CODES.append({
+            "user_id": user_id,
+            "email": email,
+            "code": code,
+            "expires_at": expires_at.isoformat(),
+            "created_at": created.isoformat(),
+        })
+        del _RECENT_CODES[:-_RECENT_CAP]
 
 
 @bp.post("/forgot-password")
 def forgot_password():
     payload = request.get_json(silent=True) or {}
-    email = str(payload.get("email", "")).strip().lower()
-    created = False
+    email = payload.get("email")
+    if not isinstance(email, str) or not email.strip():
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Email zaroori hai."}}), 400
+    email = email.strip().lower()
 
-    if email and len(email) <= 320 and "@" in email:
-        conn = None
-        try:
-            code = f"{secrets.randbelow(1_000_000):06d}"
-            token_hash = hashlib.sha256(code.encode()).hexdigest()
-            expires = datetime.now(timezone.utc) + timedelta(minutes=RESET_TTL_MINUTES)
-
-            conn = _conn()
-            cur = conn.cursor()
+    delivered = False
+    conn = None
+    try:
+        conn = _conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id FROM {_q(USERS_TABLE)} WHERE {_q(USER_EMAIL_COL)} = %s LIMIT 1",
+            (email,),
+        )
+        row = cur.fetchone()
+        if row:
+            user_id = row[0]
+            code = _generate_code()
+            expires_at = _utcnow() + timedelta(minutes=CODE_TTL_MINUTES)
             cur.execute(
-                f"SELECT {_q(USER_ID_COL)} FROM {_q(USERS_TABLE)} "
-                f"WHERE lower({_q(USER_EMAIL_COL)}) = %s",
-                (email,),
+                f"INSERT INTO {_q(TOKENS_TABLE)} (user_id, token_hash, expires_at) "
+                f"VALUES (%s, %s, %s) RETURNING id",
+                (user_id, _code_hash(code), expires_at),
             )
-            row = cur.fetchone()
-            if row:
-                user_id = row[0]
-                cur.execute(
-                    "DELETE FROM password_reset_tokens "
-                    "WHERE user_id = %s AND used_at IS NULL",
-                    (user_id,),
-                )
-                cur.execute(
-                    "INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) "
-                    "VALUES (%s, %s, %s)",
-                    (user_id, token_hash, expires),
-                )
-                conn.commit()
-                created = True
+            conn.commit()
 
-                if not _send_code_email(email, code, RESET_TTL_MINUTES):
-                    # TEST-PHASE delivery: admin reads the code from Vercel logs.
-                    logger.warning(
-                        "password reset code user_id=%s email=%s code=%s expires=%s",
-                        user_id, email, code, expires.isoformat(),
-                    )
-        except Exception:
-            logger.exception("forgot-password failed")
-            if conn is not None:
-                try:
-                    conn.rollback()
-                except Exception:
-                    pass
-            return jsonify({"error": {"code": "reset_unavailable",
-                                      "message": "Try again later."}}), 503
-        finally:
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+            if _smtp_configured():
+                delivered = _send_email(email, code)
+            if delivered:
+                logger.info("password reset code emailed user_id=%s", user_id)
+            else:
+                # No SMTP on the free tier: code goes to the runtime log AND
+                # the admin dashboard (reset-codes endpoint) — never to the user.
+                logger.warning(
+                    "password reset code user_id=%s code=%s (SMTP not configured)",
+                    user_id, code,
+                )
+                _remember_code(user_id, email, code, expires_at)
+        else:
+            # Same response either way — no account enumeration.
+            logger.info("forgot-password requested for unknown email")
+    except Exception:
+        logger.exception("forgot-password failed")
+        if conn is not None:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        return jsonify({"error": {"code": "reset_unavailable",
+                                  "message": "Could not start password reset. Try again."}}), 503
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
-    # Same response whether or not the account exists (anti-enumeration).
-    return jsonify({"ok": True, "delivered": created}), 200
+    return jsonify({"ok": True, "delivered": delivered}), 200
 
 
 @bp.post("/reset-password")
 def reset_password():
     payload = request.get_json(silent=True) or {}
-    code = str(payload.get("code", "")).strip()
-    new_password = str(payload.get("new_password", ""))
+    code = payload.get("code")
+    new_password = payload.get("password")
 
-    if not (len(code) == 6 and code.isdigit()):
-        return jsonify({"error": {"code": "invalid_code",
-                                  "message": "Code must be 6 digits."}}), 400
-    if len(new_password) < 8 or len(new_password) > 1024:
-        return jsonify({"error": {"code": "weak_password",
-                                  "message": "Password length out of range."}}), 400
+    if not isinstance(code, str) or not code.strip():
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Reset code zaroori hai."}}), 400
+    if not isinstance(new_password, str) or len(new_password) < 8:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Password kam az kam 8 characters ka ho."}}), 400
+    code = code.strip()
 
     conn = None
     try:
-        token_hash = hashlib.sha256(code.encode()).hexdigest()
-        now = datetime.now(timezone.utc)
-
         conn = _conn()
         cur = conn.cursor()
+
         cur.execute(
-            "SELECT id, user_id, expires_at, attempts, used_at "
-            "FROM password_reset_tokens "
-            "WHERE token_hash = %s ORDER BY id DESC LIMIT 1",
-            (token_hash,),
+            f"SELECT id, user_id, expires_at, attempts FROM {_q(TOKENS_TABLE)} "
+            f"WHERE token_hash = %s AND used_at IS NULL "
+            f"ORDER BY id DESC LIMIT 1",
+            (_code_hash(code),),
         )
         row = cur.fetchone()
         if not row:
             return jsonify({"error": {"code": "invalid_code",
-                                      "message": "Invalid reset code."}}), 400
+                                      "message": "Code galat hai. Dobara check karein."}}), 400
 
-        token_id, user_id, expires_at, attempts, used_at = row
-        if used_at is not None:
-            return jsonify({"error": {"code": "invalid_code",
-                                      "message": "Code already used."}}), 400
+        token_id, user_id, expires_at, attempts = row
+        now = _utcnow()
+        if isinstance(expires_at, datetime) and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if isinstance(expires_at, datetime) and expires_at < now:
+            return jsonify({"error": {"code": "code_expired",
+                                      "message": "Code expire ho gaya. Naya code mangwayein."}}), 400
+        if int(attempts or 0) >= CODE_MAX_ATTEMPTS:
+            return jsonify({"error": {"code": "too_many_attempts",
+                                      "message": "Bohat zyada koshishen. Naya code mangwayein."}}), 400
 
-        expires = expires_at
-        if expires.tzinfo is None:
-            expires = expires.replace(tzinfo=timezone.utc)
-        if expires <= now:
-            return jsonify({"error": {"code": "invalid_code",
-                                      "message": "Code expired."}}), 410
-
-        if int(attempts) >= MAX_ATTEMPTS:
-            return jsonify({"error": {"code": "invalid_code",
-                                      "message": "Too many attempts. Request a new code."}}), 429
-
+        cur.execute(
+            f"UPDATE {_q(TOKENS_TABLE)} SET used_at = NOW() WHERE id = %s",
+            (token_id,),
+        )
         new_hash = generate_password_hash(new_password)
         cur.execute(
-            f"UPDATE {_q(CREDS_TABLE)} SET {_q(CREDS_PASSWORD_COL)} = %s, "
-            f"password_changed_at = now(), failed_attempt_count = 0, "
-            f"locked_until = NULL, updated_at = now() "
-            f"WHERE {_q(CREDS_USER_COL)} = %s",
-            (new_hash, user_id),
-        )
-        cur.execute(
-            "UPDATE password_reset_tokens SET used_at = %s WHERE id = %s",
-            (now, token_id),
-        )
-        cur.execute(
-            "DELETE FROM password_reset_tokens WHERE user_id = %s AND used_at IS NULL",
+            f"SELECT 1 FROM {_q(CREDS_TABLE)} WHERE user_id = %s",
             (user_id,),
         )
+        if cur.fetchone():
+            cur.execute(
+                f"UPDATE {_q(CREDS_TABLE)} SET password_hash = %s, "
+                f"password_changed_at = now(), failed_attempt_count = 0, "
+                f"locked_until = NULL, updated_at = now() WHERE user_id = %s",
+                (new_hash, user_id),
+            )
+        else:
+            cur.execute(
+                f"INSERT INTO {_q(CREDS_TABLE)} (user_id, password_hash, "
+                f"password_changed_at) VALUES (%s, %s, now())",
+                (user_id, new_hash),
+            )
         conn.commit()
-        logger.info("password reset applied user_id=%s", user_id)
-        return jsonify({"ok": True}), 200
+        logger.info("password reset completed user_id=%s", user_id)
     except Exception:
         logger.exception("reset-password failed")
         if conn is not None:
@@ -220,10 +267,12 @@ def reset_password():
             except Exception:
                 pass
         return jsonify({"error": {"code": "reset_unavailable",
-                                  "message": "Try again later."}}), 503
+                                  "message": "Reset failed. Try again."}}), 503
     finally:
         if conn is not None:
             try:
                 conn.close()
             except Exception:
                 pass
+
+    return jsonify({"ok": True}), 200

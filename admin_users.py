@@ -4,7 +4,8 @@ password). Registers as a Flask blueprint. Auth: X-Omniflow-Key header must matc
 OMNIFLOW_SERVICE_KEY or OMNIFLOW_ADMIN_API_KEY (server-to-server only).
 
 Endpoints:
-  GET  /api/v1/admin/users                     -> list platform users + lock state
+  GET  /api/v1/admin/users                        -> list platform users + lock state
+  GET  /api/v1/admin/reset-codes                  -> recent password reset codes (TEST PHASE)
   POST /api/v1/admin/users/<int:user_id>/password-reset  -> temp password (returned ONCE)
 """
 
@@ -15,6 +16,7 @@ from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 from werkzeug.security import generate_password_hash
+
 
 logger = logging.getLogger("omniflow.admin-users")
 
@@ -65,6 +67,18 @@ def _guard():
     if not _authorized():
         return jsonify({"error": {"code": "forbidden",
                                   "message": "Service key missing or invalid."}}), 403
+
+
+@bp.get("/reset-codes")
+def recent_reset_codes():
+    """TEST-PHASE: expose undelivered reset codes to the admin panel.
+
+    Populated only when SMTP is not configured. In-memory per instance —
+    cleared on cold start. Never log these beyond the existing warning line.
+    """
+    from auth_password_reset import recent_reset_codes as _codes
+
+    return jsonify({"codes": _codes()}), 200
 
 
 @bp.get("/users")
