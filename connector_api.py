@@ -312,6 +312,43 @@ def connector_bot_config():
     }), 200
 
 
+@bp.get("/profile")
+def connector_business_profile():
+    """Business profile mirror (read-only) for the laptop connector."""
+    tenant, error = _tenant_or_error(request.args.get("client_id"))
+    if error:
+        return error
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT profile, updated_at FROM "
+                    + portal_db._q(portal_db.PROFILE_TABLE) +
+                    " WHERE client_id = %s",
+                    (tenant["client_id"],),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "connector profile read")[0]), 503
+
+    profile = {}
+    updated_at = None
+    if found:
+        raw = found[0].get("profile")
+        if isinstance(raw, dict):
+            profile = raw
+        updated = found[0].get("updated_at")
+        if isinstance(updated, datetime):
+            updated_at = updated.isoformat()
+
+    return jsonify({"profile": profile, "updated_at": updated_at}), 200
+
+
 MAX_INGEST_MESSAGES = 100
 ALLOWED_DIRECTIONS = ("in", "out")
 
