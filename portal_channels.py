@@ -36,7 +36,7 @@ logger = logging.getLogger("omniflow.portal-channels")
 bp = Blueprint("portal_channels", __name__, url_prefix="/api/v1/portal")
 
 ALLOWED_STATES = ("disconnected", "connecting", "connected")
-ALLOWED_ACTIONS = ("connect", "disconnect")
+ALLOWED_ACTIONS = ("connect", "disconnect", "restart")
 
 
 def _iso(value: Any) -> Optional[str]:
