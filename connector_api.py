@@ -271,7 +271,7 @@ def connector_bot_config():
                 cur.execute(
                     "SELECT agent_name, tone, greeting, fallback,"
                     " working_hours_enabled, working_hours_start, working_hours_end,"
-                    " human_handoff_enabled, updated_at"
+                    " human_handoff_enabled, custom_instructions, updated_at"
                     " FROM " + portal_db._q(portal_db.BOT_TABLE) +
                     " WHERE client_id = %s",
                     (tenant["client_id"],),
@@ -292,6 +292,7 @@ def connector_bot_config():
             "working_hours_start": "09:00",
             "working_hours_end": "18:00",
             "human_handoff_enabled": False,
+            "custom_instructions": "",
             "updated_at": None,
         }), 200
 
@@ -308,6 +309,7 @@ def connector_bot_config():
         "working_hours_start": row.get("working_hours_start") or "09:00",
         "working_hours_end": row.get("working_hours_end") or "18:00",
         "human_handoff_enabled": row.get("human_handoff_enabled") is True,
+        "custom_instructions": row.get("custom_instructions") or "",
         "updated_at": updated.isoformat() if isinstance(updated, datetime) else None,
     }), 200
 

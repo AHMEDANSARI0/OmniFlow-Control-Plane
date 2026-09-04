@@ -49,6 +49,7 @@ DEFAULTS: Dict[str, Any] = {
     "working_hours_start": "09:00",
     "working_hours_end": "18:00",
     "human_handoff_enabled": False,
+    "custom_instructions": "",
 }
 
 
@@ -114,6 +115,11 @@ def _validated_config(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
 
     handoff = _as_bool(_pick(payload, "human_handoff_enabled", "humanHandoffEnabled"), False)
 
+    custom_instructions = _pick(payload, "custom_instructions", "customInstructions")
+    custom_instructions = custom_instructions if isinstance(custom_instructions, str) else ""
+    if not _TEXT_RE.match(custom_instructions):
+        return None, "Custom instructions 2000 characters se chhote rakhein."
+
     config = {
         "agent_name": agent_name,
         "tone": tone,
@@ -123,6 +129,7 @@ def _validated_config(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
         "working_hours_start": wh_start,
         "working_hours_end": wh_end,
         "human_handoff_enabled": handoff,
+        "custom_instructions": custom_instructions,
     }
     return config, None
 
@@ -146,7 +153,7 @@ def get_bot_config():
                 cur.execute(
                     "SELECT agent_name, tone, greeting, fallback,"
                     " working_hours_enabled, working_hours_start, working_hours_end,"
-                    " human_handoff_enabled, updated_at"
+                    " human_handoff_enabled, custom_instructions, updated_at"
                     " FROM " + portal_db._q(portal_db.BOT_TABLE) +
                     " WHERE client_id = %s",
                     (principal["client_id"],),
@@ -170,6 +177,7 @@ def get_bot_config():
             "working_hours_start": row.get("working_hours_start") or DEFAULTS["working_hours_start"],
             "working_hours_end": row.get("working_hours_end") or DEFAULTS["working_hours_end"],
             "human_handoff_enabled": row.get("human_handoff_enabled") is True,
+            "custom_instructions": row.get("custom_instructions") or "",
         }
         updated_at = _iso(row.get("updated_at"))
 
@@ -208,8 +216,8 @@ def put_bot_config():
                     "INSERT INTO " + portal_db._q(portal_db.BOT_TABLE) +
                     " (client_id, agent_name, tone, greeting, fallback,"
                     " working_hours_enabled, working_hours_start, working_hours_end,"
-                    " human_handoff_enabled, updated_by, updated_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()) "
+                    " human_handoff_enabled, custom_instructions, updated_by, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()) "
                     "ON CONFLICT (client_id) DO UPDATE SET "
                     " agent_name = EXCLUDED.agent_name,"
                     " tone = EXCLUDED.tone,"
@@ -219,6 +227,7 @@ def put_bot_config():
                     " working_hours_start = EXCLUDED.working_hours_start,"
                     " working_hours_end = EXCLUDED.working_hours_end,"
                     " human_handoff_enabled = EXCLUDED.human_handoff_enabled,"
+                    " custom_instructions = EXCLUDED.custom_instructions,"
                     " updated_by = EXCLUDED.updated_by,"
                     " updated_at = NOW() "
                     "RETURNING updated_at",
@@ -226,6 +235,7 @@ def put_bot_config():
                      config["greeting"], config["fallback"],
                      config["working_hours_enabled"], config["working_hours_start"],
                      config["working_hours_end"], config["human_handoff_enabled"],
+                     config["custom_instructions"],
                      principal["user_id"]),
                 )
                 inserted = portal_db.rows(cur)
