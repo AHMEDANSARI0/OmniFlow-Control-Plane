@@ -86,7 +86,7 @@ def list_conversations():
     status = (request.args.get("status") or "all").strip().lower()
     if status not in ALLOWED_STATUS:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "status all|open|closed hon."}}), 400
+                                  "message": "status must be all, open, or closed."}}), 400
     raw_limit = request.args.get("limit", "")
     try:
         limit = int(raw_limit) if raw_limit else 50
@@ -144,7 +144,7 @@ def conversation_detail(conversation_id: int):
                 if not found:
                     # Other tenant's (or unknown) conversation -> plain 404.
                     return jsonify({"error": {"code": "not_found",
-                                              "message": "Conversation nahi mili."}}), 404
+                                              "message": "Conversation not found."}}), 404
                 cur.execute(
                     "SELECT id, direction, body, status, created_at FROM "
                     + portal_db._q(portal_db.MSGS_TABLE) +

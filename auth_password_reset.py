@@ -94,8 +94,8 @@ def _send_email(to_address: str, code: str) -> bool:
         msg["To"] = to_address
         msg.set_content(
             "Your OmniFlow password reset code is: " + code + "\n\n"
-            "Ye code " + str(CODE_TTL_MINUTES) + " minutes ke liye valid hai.\n"
-            "Agar aapne ye request nahi ki, is email ko ignore karein."
+            "This code is valid for " + str(CODE_TTL_MINUTES) + " minutes.\n"
+            "If you did not request this, you can safely ignore this email."
         )
         port = int(os.environ.get("SMTP_PORT", "587"))
         with smtplib.SMTP(host, port, timeout=15) as server:
@@ -136,7 +136,7 @@ def forgot_password():
     email = payload.get("email")
     if not isinstance(email, str) or not email.strip():
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Email zaroori hai."}}), 400
+                                  "message": "Email is required."}}), 400
     email = email.strip().lower()
 
     delivered = False
@@ -202,10 +202,10 @@ def reset_password():
 
     if not isinstance(code, str) or not code.strip():
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Reset code zaroori hai."}}), 400
+                                  "message": "Reset code is required."}}), 400
     if not isinstance(new_password, str) or len(new_password) < 8:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Password kam az kam 8 characters ka ho."}}), 400
+                                  "message": "Password must be at least 8 characters."}}), 400
     code = code.strip()
 
     conn = None
@@ -222,7 +222,7 @@ def reset_password():
         row = cur.fetchone()
         if not row:
             return jsonify({"error": {"code": "invalid_code",
-                                      "message": "Code galat hai. Dobara check karein."}}), 400
+                                      "message": "Invalid code. Please check it and try again."}}), 400
 
         token_id, user_id, expires_at, attempts = row
         now = _utcnow()
@@ -230,10 +230,10 @@ def reset_password():
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if isinstance(expires_at, datetime) and expires_at < now:
             return jsonify({"error": {"code": "code_expired",
-                                      "message": "Code expire ho gaya. Naya code mangwayein."}}), 400
+                                      "message": "This code has expired. Please request a new one."}}), 400
         if int(attempts or 0) >= CODE_MAX_ATTEMPTS:
             return jsonify({"error": {"code": "too_many_attempts",
-                                      "message": "Bohat zyada koshishen. Naya code mangwayein."}}), 400
+                                      "message": "Too many attempts. Please request a new code."}}), 400
 
         cur.execute(
             f"UPDATE {_q(TOKENS_TABLE)} SET used_at = NOW() WHERE id = %s",

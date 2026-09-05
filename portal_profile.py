@@ -97,17 +97,17 @@ def put_profile():
     payload = request.get_json(silent=True) or {}
     if "profile" not in payload or not isinstance(payload.get("profile"), dict):
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "profile object zaroori hai."}}), 400
+                                  "message": "The profile object is required."}}), 400
 
     profile = payload["profile"]
     try:
         serialized = jsonify(profile).get_data(as_text=True)
     except Exception:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Profile JSON serializable nahi hai."}}), 400
+                                  "message": "Profile must be JSON-serializable."}}), 400
     if len(serialized.encode("utf-8")) > MAX_PROFILE_BYTES:
         return jsonify({"error": {"code": "too_large",
-                                  "message": "Profile 32KB se bara nahi ho sakta."}}), 400
+                                  "message": "Profile cannot exceed 32KB."}}), 400
 
     try:
         portal_db.ensure_tables()

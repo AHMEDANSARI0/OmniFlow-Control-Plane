@@ -1,13 +1,13 @@
 """
 OmniFlow Control Plane — CONNECTOR endpoints (WhatsApp connector bridge).
 
-Ye endpoints customer ke apne device (home laptop) par chalne wale connector
-ke liye hain — server par WhatsApp session KABHI nahi chalta. Auth:
-X-Omniflow-Key header = OMNIFLOW_SERVICE_KEY ya OMNIFLOW_ADMIN_API_KEY
-(wahi proven pattern jo admin endpoints use karte hain).
+These endpoints serve the connector that runs on the customer's own device
+(home laptop) — the WhatsApp session NEVER runs on the server. Auth:
+X-Omniflow-Key header = OMNIFLOW_SERVICE_KEY or OMNIFLOW_ADMIN_API_KEY
+(the same proven pattern used by the admin endpoints).
 
-Connector ka tenant resolve hota hai (pehla match jeeta):
-  1. Request body/query me explicit `client_id`
+The connector's tenant is resolved as follows (first match wins):
+  1. Explicit `client_id` in the request body/query
   2. Backend env OMNIFLOW_CONNECTOR_USER_EMAIL -> platform_users lookup
 
 Endpoints:
@@ -113,8 +113,8 @@ def _tenant_or_error(explicit_client_id: Any):
         return None, (jsonify({"error": {
             "code": "connector_not_configured",
             "message": (
-                "Connector tenant resolve nahi hua: body/query me client_id bhejein "
-                "ya backend par OMNIFLOW_CONNECTOR_USER_EMAIL set karein."
+                "Connector tenant could not be resolved: send client_id in the "
+                "body/query, or set OMNIFLOW_CONNECTOR_USER_EMAIL on the backend."
             ),
         }}), 503)
     return tenant, None
@@ -144,7 +144,7 @@ def report_status():
     state = payload.get("state")
     if state not in ALLOWED_STATES:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "state disconnected|connecting|connected hon."}}), 400
+                                  "message": "state must be disconnected, connecting, or connected."}}), 400
     phone = payload.get("phone")
     phone = phone.strip() if isinstance(phone, str) else None
     account_name = payload.get("account_name")
@@ -228,7 +228,7 @@ def ack_command():
     command_id = payload.get("command_id")
     if isinstance(command_id, bool) or not isinstance(command_id, int) or command_id <= 0:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "command_id (positive int) zaroori hai."}}), 400
+                                  "message": "command_id (a positive int) is required."}}), 400
     ok_flag = payload.get("ok") is True
     note = payload.get("note")
     note = note if isinstance(note, str) else None
@@ -253,7 +253,7 @@ def ack_command():
 
     if not updated:
         return jsonify({"error": {"code": "not_found",
-                                  "message": "Command nahi mili."}}), 404
+                                  "message": "Command not found."}}), 404
     return jsonify({"ok": True}), 200
 
 
@@ -375,22 +375,22 @@ def ingest_whatsapp_messages():
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "messages (non-empty list) zaroori hai."}}), 400
+                                  "message": "messages (a non-empty list) is required."}}), 400
     if len(messages) > MAX_INGEST_MESSAGES:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Aik request me max "
+                                  "message": "Send at most "
                                              + str(MAX_INGEST_MESSAGES)
-                                             + " messages bhejein."}}), 400
+                                             + " messages per request."}}), 400
 
     normalized = []
     for item in messages:
         if not isinstance(item, dict):
             return jsonify({"error": {"code": "bad_request",
-                                      "message": "Har message aik object ho."}}), 400
+                                      "message": "Each message must be an object."}}), 400
         sender = item.get("from")
         if not isinstance(sender, str) or not sender.strip():
             return jsonify({"error": {"code": "bad_request",
-                                      "message": "Har message me 'from' zaroori hai."}}), 400
+                                      "message": "Each message requires a 'from' field."}}), 400
         body = item.get("body")
         if body is None:
             body = ""
@@ -399,7 +399,7 @@ def ingest_whatsapp_messages():
         direction = item.get("direction", "in")
         if direction not in ALLOWED_DIRECTIONS:
             return jsonify({"error": {"code": "bad_request",
-                                      "message": "direction in|out hon."}}), 400
+                                      "message": "direction must be 'in' or 'out'."}}), 400
         name = item.get("name")
         name = name.strip() if isinstance(name, str) else None
         normalized.append({

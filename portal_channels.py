@@ -112,7 +112,11 @@ def post_whatsapp_action():
     message = (
         "Connect request queued — your connector will link the WhatsApp account shortly."
         if action == "connect"
-        else "Disconnect request queued — your connector will log the account out."
+        else (
+            "Restart request queued — your connector will refresh the session."
+            if action == "restart"
+            else "Disconnect request queued — your connector will log the account out."
+        )
     )
 
     try:
