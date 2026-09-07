@@ -18,13 +18,18 @@ Read-only for now: messages enter through the CONNECTOR ingest endpoint
 for both human sessions and portal API keys (ofk_ — read-only anyway).
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
 from flask import Blueprint, jsonify, request
 
-from portal_auth import PortalAuthUnavailable, authenticate_portal_request
+from portal_auth import (
+    PortalAuthUnavailable,
+    authenticate_portal_request,
+    ensure_human_principal,
+)
 import portal_db
 
 
@@ -227,3 +232,78 @@ def update_conversation(conversation_id: int):
         return jsonify({"error": {"code": "not_found",
                                   "message": "Conversation not found."}}), 404
     return jsonify({"conversation": _conversation_public(updated[0])}), 200
+
+
+@bp.post("/conversations/<int:conversation_id>/messages")
+def enqueue_conversation_message(conversation_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+
+    payload = request.get_json(silent=True) or {}
+    body = payload.get("body")
+    if not isinstance(body, str) or not body.strip():
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message body is required."}}), 400
+    body = body.strip()
+    if len(body) > 4096:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message must be under 4096 characters."}}), 400
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, contact_id, contact_name FROM "
+                    + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE id = %s AND client_id = %s LIMIT 1",
+                    (conversation_id, principal["client_id"]),
+                )
+                found = portal_db.rows(cur)
+                if not found:
+                    # Other tenant's (or unknown) conversation -> plain 404.
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Conversation not found."}}), 404
+                contact_id = str(found[0].get("contact_id") or "").strip()
+                if not contact_id:
+                    return jsonify({"error": {"code": "bad_request",
+                                              "message": "This conversation has no deliverable contact."}}), 400
+                command_payload = {
+                    "external_user_id": contact_id,
+                    "body": body,
+                    "conversation_id": conversation_id,
+                }
+                display_name = found[0].get("contact_name")
+                if display_name:
+                    command_payload["target_display_name"] = display_name
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
+                    " (client_id, channel, action, payload, status, requested_by,"
+                    " created_at, updated_at) "
+                    "VALUES (%s, 'whatsapp', 'send_message', CAST(%s AS JSONB),"
+                    " 'pending', %s, NOW(), NOW()) "
+                    "RETURNING id",
+                    (principal["client_id"], json.dumps(command_payload),
+                     principal["user_id"]),
+                )
+                inserted = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "portal message enqueue")[0]), 503
+
+    logger.info(
+        "portal send_message queued id=%s conversation=%s client=%s",
+        inserted[0].get("id") if inserted else "?",
+        conversation_id,
+        principal["client_id"],
+    )
+    return jsonify({"ok": True, "queued": True,
+                    "command_id": inserted[0].get("id") if inserted else None}), 200
