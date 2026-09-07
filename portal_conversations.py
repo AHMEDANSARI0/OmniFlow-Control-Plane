@@ -188,3 +188,42 @@ def conversation_detail(conversation_id: int):
         "conversation": _conversation_public(found[0]),
         "messages": [_message_public(m) for m in reversed(msgs)],
     }), 200
+
+
+@bp.patch("/conversations/<int:conversation_id>")
+def update_conversation(conversation_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    payload = request.get_json(silent=True) or {}
+    status = payload.get("status")
+    if status not in ("open", "closed"):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "status must be open or closed."}}), 400
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                    " SET status = %s, updated_at = NOW()"
+                    " WHERE id = %s AND client_id = %s"
+                    " RETURNING id, channel, contact_id, contact_name, status,"
+                    " last_message_at, last_message_preview, created_at",
+                    (status, conversation_id, principal["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "conversation update")[0]), 503
+
+    if not updated:
+        # Other tenant's (or unknown) conversation -> plain 404.
+        return jsonify({"error": {"code": "not_found",
+                                  "message": "Conversation not found."}}), 404
+    return jsonify({"conversation": _conversation_public(updated[0])}), 200
