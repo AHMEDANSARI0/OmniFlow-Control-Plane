@@ -29,6 +29,8 @@ from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
 
+from intent_classifier import classify_intent
+
 import portal_db
 
 
@@ -402,11 +404,17 @@ def ingest_whatsapp_messages():
                                       "message": "direction must be 'in' or 'out'."}}), 400
         name = item.get("name")
         name = name.strip() if isinstance(name, str) else None
+        item_intent = (
+            classify_intent(body)
+            if direction == "in"
+            else None
+        )
         normalized.append({
             "from": sender.strip(),
             "body": body,
             "name": name,
             "direction": direction,
+            "intent": item_intent,
         })
 
     inserted = 0
@@ -420,27 +428,31 @@ def ingest_whatsapp_messages():
                         "INSERT INTO " + portal_db._q(portal_db.CONV_TABLE) +
                         " (client_id, channel, contact_id, contact_name,"
                         " status, last_message_preview, last_message_at,"
-                        " created_at, updated_at) "
-                        "VALUES (%s, 'whatsapp', %s, %s, 'open', %s, NOW(), NOW(), NOW()) "
+                        " last_intent, created_at, updated_at) "
+                        "VALUES (%s, 'whatsapp', %s, %s, 'open', %s, NOW(), %s, NOW(), NOW()) "
                         "ON CONFLICT (client_id, channel, contact_id) DO UPDATE SET "
                         " contact_name = COALESCE(EXCLUDED.contact_name,"
                         " " + portal_db._q(portal_db.CONV_TABLE) + ".contact_name), "
                         " last_message_preview = EXCLUDED.last_message_preview, "
                         " last_message_at = EXCLUDED.last_message_at, "
+                        " last_intent = COALESCE(EXCLUDED.last_intent, "
+                        " " + portal_db._q(portal_db.CONV_TABLE) + ".last_intent), "
                         " updated_at = NOW() "
                         "RETURNING id",
-                        (tenant["client_id"], item["from"], item["name"], item["body"]),
+                        (tenant["client_id"], item["from"], item["name"], item["body"],
+                         item["intent"]),
                     )
                     conv = portal_db.rows(cur)
                     conversation_id = conv[0]["id"] if conv else None
                     cur.execute(
                         "INSERT INTO " + portal_db._q(portal_db.MSGS_TABLE) +
                         " (conversation_id, client_id, direction, body,"
-                        " sender_name, status, created_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+                        " sender_name, status, intent, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())",
                         (conversation_id, tenant["client_id"], item["direction"],
                          item["body"], item["name"],
-                         "received" if item["direction"] == "in" else "sent"),
+                         "received" if item["direction"] == "in" else "sent",
+                         item["intent"]),
                     )
                     inserted += 1
             conn.commit()

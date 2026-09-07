@@ -72,6 +72,7 @@ def _conversation_public(row: Any) -> dict:
         "last_message_preview": row.get("last_message_preview"),
         "created_at": _iso(row.get("created_at")),
         "unread": bool(row.get("unread")),
+        "last_intent": row.get("last_intent"),
     }
 
 
@@ -81,6 +82,7 @@ def _message_public(row: Any) -> dict:
         "direction": row.get("direction") or "in",
         "body": row.get("body") or "",
         "status": row.get("status") or "received",
+        "intent": row.get("intent"),
         "created_at": _iso(row.get("created_at")),
     }
 
@@ -108,7 +110,7 @@ def list_conversations():
 
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
-        " c.last_message_at, c.last_message_preview, c.created_at,"
+        " c.last_message_at, c.last_message_preview, c.created_at, c.last_intent,"
         " EXISTS ("
         " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
         " m WHERE m.conversation_id = c.id AND m.direction = 'in'"
@@ -121,6 +123,10 @@ def list_conversations():
     if status != "all":
         sql += " AND c.status = %s"
         params.append(status)
+    intent_filter = (request.args.get("intent") or "").strip().lower()
+    if intent_filter and intent_filter != "all":
+        sql += " AND c.last_intent = %s"
+        params.append(intent_filter[:40])
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
@@ -171,7 +177,7 @@ def conversation_detail(conversation_id: int):
                     return jsonify({"error": {"code": "not_found",
                                               "message": "Conversation not found."}}), 404
                 cur.execute(
-                    "SELECT id, direction, body, status, created_at FROM "
+                    "SELECT id, direction, body, status, intent, created_at FROM "
                     + portal_db._q(portal_db.MSGS_TABLE) +
                     " WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
                     (conversation_id, MESSAGE_PAGE_SIZE),
@@ -193,6 +199,33 @@ def conversation_detail(conversation_id: int):
         "conversation": _conversation_public(found[0]),
         "messages": [_message_public(m) for m in reversed(msgs)],
     }), 200
+
+
+@bp.get("/conversations/intents/summary")
+def conversation_intent_summary():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT c.last_intent AS intent, COUNT(*) AS conversations"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " c WHERE c.client_id = %s AND c.last_intent IS NOT NULL"
+                    " GROUP BY c.last_intent ORDER BY COUNT(*) DESC",
+                    (principal["client_id"],),
+                )
+                summary = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "intent summary")[0]), 503
+
+    return jsonify({"intents": summary}), 200
 
 
 @bp.patch("/conversations/<int:conversation_id>")

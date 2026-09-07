@@ -124,6 +124,10 @@ CREATE INDEX IF NOT EXISTS idx_portal_messages_conv
   ON portal_messages (conversation_id, id);
 ALTER TABLE portal_conversations
   ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
+ALTER TABLE portal_messages
+  ADD COLUMN IF NOT EXISTS intent TEXT;
+ALTER TABLE portal_conversations
+  ADD COLUMN IF NOT EXISTS last_intent TEXT;
 """
 
 
