@@ -1,10 +1,12 @@
 """
 OmniFlow Control Plane — portal conversations (customer-scoped inbox).
 
-GET /api/v1/portal/conversations            ?status=all|open|closed&limit=50
+GET /api/v1/portal/conversations            ?status=all|open|closed&limit=50&q=search
     -> {conversations: [{id, channel, contact_id, contact_name, status,
-                         last_message_at, last_message_preview, created_at}]}
-       newest conversation first.
+                         last_message_at, last_message_preview, created_at,
+                         unread}]}
+       newest conversation first. `q` searches contact name, contact id and
+       message bodies (case-insensitive). Opening a conversation marks it read.
 
 GET /api/v1/portal/conversations/<id>
     -> {conversation: {...}, messages: [{id, direction, body, status,
@@ -64,6 +66,7 @@ def _conversation_public(row: Any) -> dict:
         "last_message_at": _iso(row.get("last_message_at")),
         "last_message_preview": row.get("last_message_preview"),
         "created_at": _iso(row.get("created_at")),
+        "unread": bool(row.get("unread")),
     }
 
 
@@ -94,17 +97,34 @@ def list_conversations():
         limit = 50
     limit = max(1, min(50, limit))
 
+    search = (request.args.get("q") or "").strip()
+    if len(search) > 100:
+        search = search[:100]
+
     sql = (
-        "SELECT id, channel, contact_id, contact_name, status,"
-        " last_message_at, last_message_preview, created_at FROM "
-        + portal_db._q(portal_db.CONV_TABLE) +
-        " WHERE client_id = %s"
+        "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
+        " c.last_message_at, c.last_message_preview, c.created_at,"
+        " EXISTS ("
+        " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+        " m WHERE m.conversation_id = c.id AND m.direction = 'in'"
+        " AND m.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0))"
+        " ) AS unread FROM "
+        + portal_db._q(portal_db.CONV_TABLE) + " c"
+        " WHERE c.client_id = %s"
     )
     params = [principal["client_id"]]
     if status != "all":
-        sql += " AND status = %s"
+        sql += " AND c.status = %s"
         params.append(status)
-    sql += " ORDER BY last_message_at DESC NULLS LAST, id DESC LIMIT %s"
+    if search:
+        like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        sql += (
+            " AND (c.contact_name ILIKE %s OR c.contact_id ILIKE %s"
+            " OR EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " sm WHERE sm.conversation_id = c.id AND sm.body ILIKE %s))"
+        )
+        params.extend([like, like, like])
+    sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
     params.append(limit)
 
     try:
@@ -152,6 +172,13 @@ def conversation_detail(conversation_id: int):
                     (conversation_id, MESSAGE_PAGE_SIZE),
                 )
                 msgs = portal_db.rows(cur)
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                    " SET last_read_at = NOW()"
+                    " WHERE id = %s AND client_id = %s",
+                    (conversation_id, principal["client_id"]),
+                )
+            conn.commit()
         finally:
             conn.close()
     except Exception as error:
