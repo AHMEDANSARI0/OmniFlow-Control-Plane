@@ -315,7 +315,7 @@ def enqueue_conversation_message(conversation_id: int):
         try:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, contact_id, contact_name FROM "
+                    "SELECT id, channel, contact_id, contact_name FROM "
                     + portal_db._q(portal_db.CONV_TABLE) +
                     " WHERE id = %s AND client_id = %s LIMIT 1",
                     (conversation_id, principal["client_id"]),
@@ -329,6 +329,36 @@ def enqueue_conversation_message(conversation_id: int):
                 if not contact_id:
                     return jsonify({"error": {"code": "bad_request",
                                               "message": "This conversation has no deliverable contact."}}), 400
+                if (found[0].get("channel") or "") == "website":
+                    # Website chats deliver inside the widget itself: store
+                    # the reply directly instead of queueing a WhatsApp
+                    # command (the bridge is WhatsApp-only).
+                    cur.execute(
+                        "INSERT INTO " + portal_db._q(portal_db.MSGS_TABLE) +
+                        " (conversation_id, client_id, direction, body,"
+                        " sender_name, status, created_at)"
+                        " VALUES (%s, %s, 'out', %s, NULL, 'sent', NOW())",
+                        (conversation_id, principal["client_id"], body),
+                    )
+                    cur.execute(
+                        "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                        " SET last_message_at = NOW(),"
+                        " last_message_preview = %s, updated_at = NOW()"
+                        " WHERE id = %s AND client_id = %s",
+                        (body[:120], conversation_id, principal["client_id"]),
+                    )
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "message.sent",
+                        "customer_user",
+                        principal.get("user_id"),
+                        conversation_id,
+                        "Website reply delivered in widget.",
+                    )
+                    conn.commit()
+                    return jsonify({"ok": True, "queued": False,
+                                    "command_id": None}), 200
                 command_payload = {
                     "external_user_id": contact_id,
                     "body": body,

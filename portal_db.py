@@ -35,6 +35,7 @@ NOTES_TABLE = os.environ.get("OF_NOTES_TABLE", "portal_conversation_notes")
 BROADCASTS_TABLE = os.environ.get("OF_BROADCASTS_TABLE", "portal_broadcasts")
 GAPS_TABLE = os.environ.get("OF_GAPS_TABLE", "portal_kb_gaps")
 CSAT_TABLE = os.environ.get("OF_CSAT_TABLE", "portal_csat_requests")
+WIDGET_TABLE = os.environ.get("OF_WIDGET_TABLE", "portal_widget_settings")
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -293,6 +294,14 @@ CREATE TABLE IF NOT EXISTS portal_csat_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_csat
   ON portal_csat_requests (client_id, score);
+CREATE TABLE IF NOT EXISTS portal_widget_settings (
+  id INT PRIMARY KEY,
+  client_id BIGINT,
+  enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  business_name TEXT NOT NULL DEFAULT '',
+  welcome_text TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 
