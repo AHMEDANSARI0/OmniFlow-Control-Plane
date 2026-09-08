@@ -30,6 +30,8 @@ PROFILE_TABLE = os.environ.get("OF_PROFILE_TABLE", "portal_profiles")
 APIKEY_TABLE = os.environ.get("OF_APIKEY_TABLE", "portal_api_keys")
 CONV_TABLE = os.environ.get("OF_CONV_TABLE", "portal_conversations")
 MSGS_TABLE = os.environ.get("OF_MSGS_TABLE", "portal_messages")
+TEAM_TABLE = os.environ.get("OF_TEAM_TABLE", "portal_team_members")
+NOTES_TABLE = os.environ.get("OF_NOTES_TABLE", "portal_conversation_notes")
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -227,6 +229,32 @@ CREATE TABLE IF NOT EXISTS portal_orders (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_orders_client
   ON portal_orders (client_id, updated_at DESC);
+ALTER TABLE portal_conversations
+  ADD COLUMN IF NOT EXISTS assigned_to TEXT;
+CREATE TABLE IF NOT EXISTS portal_team_members (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  email TEXT NOT NULL,
+  name TEXT NOT NULL DEFAULT '',
+  role TEXT NOT NULL DEFAULT 'agent',
+  status TEXT NOT NULL DEFAULT 'active',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT uq_portal_team_email UNIQUE (client_id, email)
+);
+CREATE INDEX IF NOT EXISTS idx_portal_team_client
+  ON portal_team_members (client_id, status);
+CREATE TABLE IF NOT EXISTS portal_conversation_notes (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  conversation_id BIGINT NOT NULL,
+  author_email TEXT NOT NULL DEFAULT '',
+  author_name TEXT NOT NULL DEFAULT '',
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_conv_notes
+  ON portal_conversation_notes (conversation_id, id DESC);
 """
 
 

@@ -75,6 +75,8 @@ def _conversation_public(row: Any) -> dict:
         "last_intent": row.get("last_intent"),
         "lead_score": int(row.get("lead_score") or 0),
         "lead_temp": row.get("lead_temp") or "cold",
+        "assigned_to": row.get("assigned_to"),
+        "assignee_name": row.get("assignee_name"),
     }
 
 
@@ -113,13 +115,15 @@ def list_conversations():
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
         " c.last_message_at, c.last_message_preview, c.created_at, c.last_intent,"
-        " c.lead_score, c.lead_temp,"
+        " c.lead_score, c.lead_temp, c.assigned_to, tm.name AS assignee_name,"
         " EXISTS ("
         " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
         " m WHERE m.conversation_id = c.id AND m.direction = 'in'"
         " AND m.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0))"
         " ) AS unread FROM "
         + portal_db._q(portal_db.CONV_TABLE) + " c"
+        " LEFT JOIN " + portal_db._q(portal_db.TEAM_TABLE) + " tm"
+        " ON tm.client_id = c.client_id AND tm.email = c.assigned_to"
         " WHERE c.client_id = %s"
     )
     params = [principal["client_id"]]
@@ -170,9 +174,12 @@ def conversation_detail(conversation_id: int):
                 cur.execute(
                     "SELECT id, channel, contact_id, contact_name, status,"
                     " last_message_at, last_message_preview, created_at,"
-                    " lead_score, lead_temp FROM "
-                    + portal_db._q(portal_db.CONV_TABLE) +
-                    " WHERE id = %s AND client_id = %s LIMIT 1",
+                    " c.lead_score, c.lead_temp, c.assigned_to,"
+                    " tm.name AS assignee_name FROM "
+                    + portal_db._q(portal_db.CONV_TABLE) + " c"
+                    " LEFT JOIN " + portal_db._q(portal_db.TEAM_TABLE) + " tm"
+                    " ON tm.client_id = c.client_id AND tm.email = c.assigned_to"
+                    " WHERE c.id = %s AND c.client_id = %s LIMIT 1",
                     (conversation_id, principal["client_id"]),
                 )
                 found = portal_db.rows(cur)
