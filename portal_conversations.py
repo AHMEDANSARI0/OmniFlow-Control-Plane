@@ -254,6 +254,16 @@ def update_conversation(conversation_id: int):
                     (status, conversation_id, principal["client_id"]),
                 )
                 updated = portal_db.rows(cur)
+                if updated:
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "conversation.status_changed",
+                        "customer_user",
+                        principal.get("user_id"),
+                        conversation_id,
+                        "Status set to " + str(status) + ".",
+                    )
             conn.commit()
         finally:
             conn.close()
@@ -326,6 +336,16 @@ def enqueue_conversation_message(conversation_id: int):
                      principal["user_id"]),
                 )
                 inserted = portal_db.rows(cur)
+                if inserted:
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "message.enqueued",
+                        "customer_user",
+                        principal.get("user_id"),
+                        conversation_id,
+                        "Reply queued for delivery.",
+                    )
             conn.commit()
         finally:
             conn.close()

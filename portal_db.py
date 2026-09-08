@@ -171,6 +171,31 @@ CREATE TABLE IF NOT EXISTS portal_kb_entries (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_kb_entries
   ON portal_kb_entries (client_id, is_active, updated_at DESC);
+CREATE TABLE IF NOT EXISTS portal_catalog (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'product',
+  name TEXT NOT NULL,
+  price_text TEXT NOT NULL DEFAULT '',
+  notes TEXT NOT NULL DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_catalog
+  ON portal_catalog (client_id, kind, is_active);
+CREATE TABLE IF NOT EXISTS portal_action_log (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  action TEXT NOT NULL,
+  actor_kind TEXT NOT NULL DEFAULT 'customer_user',
+  actor_user_id BIGINT,
+  conversation_id BIGINT,
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_action_log
+  ON portal_action_log (client_id, id DESC);
 """
 
 
@@ -225,6 +250,17 @@ def rows(cur) -> List[Dict[str, Any]]:
         return []
     cols = [d[0] for d in cur.description]
     return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+def log_action(cur, client_id, action, actor_kind="customer_user",
+               actor_user_id=None, conversation_id=None, note=""):
+    """Append one row to the action audit log (portal_action_log)."""
+    cur.execute(
+        "INSERT INTO " + _q("portal_action_log") +
+        " (client_id, action, actor_kind, actor_user_id, conversation_id,"
+        " note, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
+        (client_id, action, actor_kind, actor_user_id, conversation_id, note),
+    )
 
 
 def portal_unavailable(error: Exception, context: str) -> Any:

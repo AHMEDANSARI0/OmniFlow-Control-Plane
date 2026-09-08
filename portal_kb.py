@@ -202,6 +202,16 @@ def maybe_auto_reply(client_id, conversation_id, contact_id, contact_name,
             " SET usage_count = usage_count + 1 WHERE id = %s",
             (entry.get("id"),),
         )
+        portal_db.log_action(
+            cur,
+            client_id,
+            "kb.auto_reply",
+            "system",
+            None,
+            conversation_id,
+            ("Instant answer sent: "
+             + str(entry.get("title") or ""))[:200],
+        )
     logger.info(
         "knowledge base auto-reply queued entry=%s conversation=%s client=%s",
         entry.get("id"),

@@ -257,10 +257,22 @@ def connector_followup_ack():
                     " last_note = %s, updated_at = NOW()"
                     " FROM " + portal_db._q("portal_followup_settings") + " s"
                     " WHERE s.client_id = f.client_id AND f.id = %s"
-                    " RETURNING f.stage, f.attempts",
+                    " RETURNING f.stage, f.attempts, f.client_id,"
+                    " f.conversation_id",
                     (note, followup_id),
                 )
                 updated = portal_db.rows(cur)
+                if updated:
+                    portal_db.log_action(
+                        cur,
+                        updated[0].get("client_id"),
+                        "followup.ack",
+                        "connector",
+                        None,
+                        updated[0].get("conversation_id"),
+                        ("Follow-up delivered." if ok
+                         else "Follow-up failed: " + str(note or ""))[:200],
+                    )
             conn.commit()
         finally:
             conn.close()
