@@ -32,6 +32,9 @@ CONV_TABLE = os.environ.get("OF_CONV_TABLE", "portal_conversations")
 MSGS_TABLE = os.environ.get("OF_MSGS_TABLE", "portal_messages")
 TEAM_TABLE = os.environ.get("OF_TEAM_TABLE", "portal_team_members")
 NOTES_TABLE = os.environ.get("OF_NOTES_TABLE", "portal_conversation_notes")
+BROADCASTS_TABLE = os.environ.get("OF_BROADCASTS_TABLE", "portal_broadcasts")
+GAPS_TABLE = os.environ.get("OF_GAPS_TABLE", "portal_kb_gaps")
+CSAT_TABLE = os.environ.get("OF_CSAT_TABLE", "portal_csat_requests")
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -255,6 +258,41 @@ CREATE TABLE IF NOT EXISTS portal_conversation_notes (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_conv_notes
   ON portal_conversation_notes (conversation_id, id DESC);
+CREATE TABLE IF NOT EXISTS portal_broadcasts (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  audience TEXT NOT NULL DEFAULT 'all',
+  body TEXT NOT NULL,
+  recipient_count INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_broadcasts
+  ON portal_broadcasts (client_id, id DESC);
+CREATE TABLE IF NOT EXISTS portal_kb_gaps (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  conversation_id BIGINT NOT NULL,
+  question TEXT NOT NULL DEFAULT '',
+  intent TEXT NOT NULL DEFAULT 'general',
+  resolved INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  resolved_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_portal_kb_gaps
+  ON portal_kb_gaps (client_id, resolved, id DESC);
+CREATE TABLE IF NOT EXISTS portal_csat_requests (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  conversation_id BIGINT NOT NULL UNIQUE,
+  contact_id TEXT NOT NULL,
+  contact_name TEXT,
+  score INT,
+  requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  answered_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_csat
+  ON portal_csat_requests (client_id, score);
 """
 
 

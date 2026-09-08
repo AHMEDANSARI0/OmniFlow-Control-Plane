@@ -33,6 +33,7 @@ from intent_classifier import classify_intent
 import portal_followups
 import portal_kb
 import portal_revenue
+import portal_growth
 
 import portal_db
 
@@ -481,7 +482,31 @@ def ingest_whatsapp_messages():
                     except Exception:
                         pass
                     try:
+                        portal_growth.record_kb_gap(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
+                            item["body"],
+                            item["intent"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
                         portal_revenue.handle_inbound(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
+                            item["body"],
+                            item["intent"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        portal_growth.handle_inbound(
                             tenant["client_id"],
                             conversation_id,
                             item["from"],
