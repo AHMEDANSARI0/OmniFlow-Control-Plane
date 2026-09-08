@@ -31,6 +31,7 @@ from flask import Blueprint, jsonify, request
 
 from intent_classifier import classify_intent
 import portal_followups
+import portal_kb
 
 import portal_db
 
@@ -461,6 +462,18 @@ def ingest_whatsapp_messages():
                             conversation_id,
                             item["from"],
                             item["name"],
+                            item["intent"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        portal_kb.maybe_auto_reply(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
+                            item["body"],
                             item["intent"],
                             conn,
                         )
