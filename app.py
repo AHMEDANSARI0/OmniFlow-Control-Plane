@@ -25,6 +25,7 @@ from portal_profile import bp as portal_profile_bp  # noqa: E402
 from portal_apikeys import bp as portal_apikeys_bp  # noqa: E402
 from portal_conversations import bp as portal_conversations_bp  # noqa: E402
 from connector_api import bp as connector_api_bp  # noqa: E402
+from portal_followups import bp as portal_followups_bp  # noqa: E402
 from portal_auth import bind_root_application  # noqa: E402
 
 
@@ -41,6 +42,7 @@ aux_app.register_blueprint(portal_profile_bp)
 aux_app.register_blueprint(portal_apikeys_bp)
 aux_app.register_blueprint(portal_conversations_bp)
 aux_app.register_blueprint(connector_api_bp)
+aux_app.register_blueprint(portal_followups_bp)
 
 _EXTENSION_PREFIXES = (
     "/api/v1/auth/forgot-password",

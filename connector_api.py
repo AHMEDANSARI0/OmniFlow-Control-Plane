@@ -30,6 +30,7 @@ from typing import Any, Dict, Optional
 from flask import Blueprint, jsonify, request
 
 from intent_classifier import classify_intent
+import portal_followups
 
 import portal_db
 
@@ -454,6 +455,17 @@ def ingest_whatsapp_messages():
                          "received" if item["direction"] == "in" else "sent",
                          item["intent"]),
                     )
+                    try:
+                        portal_followups.update_followup_state(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
+                            item["intent"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
                     inserted += 1
             conn.commit()
         finally:
