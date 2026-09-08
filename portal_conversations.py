@@ -73,6 +73,8 @@ def _conversation_public(row: Any) -> dict:
         "created_at": _iso(row.get("created_at")),
         "unread": bool(row.get("unread")),
         "last_intent": row.get("last_intent"),
+        "lead_score": int(row.get("lead_score") or 0),
+        "lead_temp": row.get("lead_temp") or "cold",
     }
 
 
@@ -111,6 +113,7 @@ def list_conversations():
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
         " c.last_message_at, c.last_message_preview, c.created_at, c.last_intent,"
+        " c.lead_score, c.lead_temp,"
         " EXISTS ("
         " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
         " m WHERE m.conversation_id = c.id AND m.direction = 'in'"
@@ -166,7 +169,8 @@ def conversation_detail(conversation_id: int):
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, channel, contact_id, contact_name, status,"
-                    " last_message_at, last_message_preview, created_at FROM "
+                    " last_message_at, last_message_preview, created_at,"
+                    " lead_score, lead_temp FROM "
                     + portal_db._q(portal_db.CONV_TABLE) +
                     " WHERE id = %s AND client_id = %s LIMIT 1",
                     (conversation_id, principal["client_id"]),
@@ -250,7 +254,8 @@ def update_conversation(conversation_id: int):
                     " SET status = %s, updated_at = NOW()"
                     " WHERE id = %s AND client_id = %s"
                     " RETURNING id, channel, contact_id, contact_name, status,"
-                    " last_message_at, last_message_preview, created_at",
+                    " last_message_at, last_message_preview, created_at,"
+                    " lead_score, lead_temp",
                     (status, conversation_id, principal["client_id"]),
                 )
                 updated = portal_db.rows(cur)

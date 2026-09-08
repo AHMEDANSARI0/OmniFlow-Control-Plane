@@ -196,6 +196,37 @@ CREATE TABLE IF NOT EXISTS portal_action_log (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_action_log
   ON portal_action_log (client_id, id DESC);
+ALTER TABLE portal_conversations
+  ADD COLUMN IF NOT EXISTS lead_score INT NOT NULL DEFAULT 0;
+ALTER TABLE portal_conversations
+  ADD COLUMN IF NOT EXISTS lead_temp TEXT NOT NULL DEFAULT 'cold';
+CREATE TABLE IF NOT EXISTS portal_cod_orders (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  conversation_id BIGINT NOT NULL UNIQUE,
+  contact_id TEXT NOT NULL,
+  contact_name TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  details TEXT NOT NULL DEFAULT '',
+  attempts INT NOT NULL DEFAULT 1,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  answered_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_portal_cod_orders
+  ON portal_cod_orders (client_id, status);
+CREATE TABLE IF NOT EXISTS portal_orders (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  code TEXT NOT NULL,
+  status_text TEXT NOT NULL DEFAULT 'pending',
+  note TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT uq_portal_order_code UNIQUE (client_id, code)
+);
+CREATE INDEX IF NOT EXISTS idx_portal_orders_client
+  ON portal_orders (client_id, updated_at DESC);
 """
 
 
