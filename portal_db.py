@@ -38,6 +38,7 @@ CSAT_TABLE = os.environ.get("OF_CSAT_TABLE", "portal_csat_requests")
 WIDGET_TABLE = os.environ.get("OF_WIDGET_TABLE", "portal_widget_settings")
 CONV_TAGS_TABLE = os.environ.get("OF_CONVTAGS_TABLE", "portal_conversation_tags")
 SAVED_REPLIES_TABLE = os.environ.get("OF_SAVEDREPLIES_TABLE", "portal_saved_replies")
+AUTOMATIONS_TABLE = os.environ.get("OF_AUTOMATIONS_TABLE", "portal_automations")
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -330,6 +331,20 @@ ALTER TABLE portal_widget_settings
   ADD COLUMN IF NOT EXISTS position TEXT NOT NULL DEFAULT 'right';
 ALTER TABLE portal_widget_settings
   ADD COLUMN IF NOT EXISTS launcher_label TEXT NOT NULL DEFAULT '';
+CREATE TABLE IF NOT EXISTS portal_automations (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  keyword TEXT NOT NULL,
+  action_type TEXT NOT NULL,
+  action_value TEXT NOT NULL,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  times_triggered INT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT uq_portal_automation UNIQUE (client_id, keyword, action_type, action_value)
+);
+CREATE INDEX IF NOT EXISTS idx_portal_automations
+  ON portal_automations (client_id, is_active);
 """
 
 

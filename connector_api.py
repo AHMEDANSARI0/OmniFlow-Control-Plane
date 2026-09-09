@@ -34,6 +34,7 @@ import portal_followups
 import portal_kb
 import portal_revenue
 import portal_growth
+import portal_conversations
 
 import portal_db
 
@@ -513,6 +514,16 @@ def ingest_whatsapp_messages():
                             item["name"],
                             item["body"],
                             item["intent"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        portal_conversations.apply_automation_rules(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["body"],
                             conn,
                         )
                     except Exception:

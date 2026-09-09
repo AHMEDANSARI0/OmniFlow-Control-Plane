@@ -17,6 +17,7 @@ from flask import Blueprint, jsonify, request
 
 import portal_db
 import portal_kb
+import portal_conversations
 import intent_classifier
 
 
@@ -242,6 +243,16 @@ def widget_send():
                 auto = _auto_answer(cur, client_id, conversation_id, text, intent)
                 if auto is not None:
                     reply_body, reply_created = auto
+                try:
+                    portal_conversations.apply_automation_rules(
+                        client_id,
+                        conversation_id,
+                        "web_" + visitor,
+                        text,
+                        conn,
+                    )
+                except Exception:
+                    pass
             conn.commit()
         finally:
             conn.close()

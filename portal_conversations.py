@@ -967,4 +967,308 @@ def list_customers():
 
 
 
+# ---------------------------------------------------------------------------
+# Automations v0 — deterministic keyword rules on inbound messages
+# ---------------------------------------------------------------------------
+
+MAX_AUTOMATIONS = 20
+MAX_KEYWORD_LENGTH = 40
+AUTOMATION_ACTION_TYPES = ("add_tag", "assign")
+AUTOMATIONS_TABLE = portal_db.AUTOMATIONS_TABLE
+
+
+def _normalize_keyword(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"\s+", " ", value).strip().lower()[:MAX_KEYWORD_LENGTH]
+
+
+def _automation_public(row: Any) -> dict:
+    return {
+        "id": int(row.get("id") or 0),
+        "keyword": str(row.get("keyword") or ""),
+        "action_type": row.get("action_type") or "add_tag",
+        "action_value": str(row.get("action_value") or ""),
+        "is_active": row.get("is_active") is True,
+        "times_triggered": int(row.get("times_triggered") or 0),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+def apply_automation_rules(client_id, conversation_id, contact_id,
+                           message_text, conn):
+    """Deterministic keyword rules for one inbound message. Tags respect the
+    6-label cap (ON CONFLICT DO NOTHING); assignment only fills unassigned
+    chats. Runs inside the caller's transaction; callers wrap in try/except."""
+    text = re.sub(r"\s+", " ", str(message_text or "")).strip().lower()
+    if not text:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, keyword, action_type, action_value FROM "
+            + portal_db._q(AUTOMATIONS_TABLE) +
+            " WHERE client_id = %s AND is_active IS TRUE"
+            " ORDER BY id LIMIT %s",
+            (client_id, MAX_AUTOMATIONS),
+        )
+        rules = portal_db.rows(cur)
+        for rule in rules:
+            keyword = str(rule.get("keyword") or "")
+            if not keyword or keyword not in text:
+                continue
+            action_type = rule.get("action_type")
+            action_value = str(rule.get("action_value") or "")
+            if action_type == "add_tag" and action_value:
+                cur.execute(
+                    "SELECT COUNT(*) AS total FROM "
+                    + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+                    " WHERE client_id = %s AND conversation_id = %s",
+                    (client_id, conversation_id),
+                )
+                counts = portal_db.rows(cur)
+                total = int(counts[0].get("total") or 0) if counts else 0
+                if total < MAX_TAGS_PER_CONVERSATION:
+                    cur.execute(
+                        "INSERT INTO " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+                        " (client_id, conversation_id, tag, created_at)"
+                        " VALUES (%s, %s, %s, NOW())"
+                        " ON CONFLICT (client_id, conversation_id, tag)"
+                        " DO NOTHING",
+                        (client_id, conversation_id, action_value),
+                    )
+            elif action_type == "assign" and action_value:
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                    " SET assigned_to = %s, updated_at = NOW()"
+                    " WHERE id = %s AND client_id = %s AND assigned_to IS NULL",
+                    (action_value, conversation_id, client_id),
+                )
+            else:
+                continue
+            cur.execute(
+                "UPDATE " + portal_db._q(AUTOMATIONS_TABLE) +
+                " SET times_triggered = times_triggered + 1 WHERE id = %s",
+                (rule.get("id"),),
+            )
+        if rules:
+            portal_db.log_action(
+                cur,
+                client_id,
+                "automation.checked",
+                "system",
+                None,
+                conversation_id,
+                ("Rules evaluated: %d" % len(rules))[:200],
+            )
+
+
+@bp.get("/automations")
+def list_automations():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, keyword, action_type, action_value, is_active,"
+                    " times_triggered, created_at FROM "
+                    + portal_db._q(AUTOMATIONS_TABLE) +
+                    " WHERE client_id = %s ORDER BY id DESC LIMIT %s",
+                    (principal["client_id"], MAX_AUTOMATIONS),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "automations read")[0]), 503
+    return jsonify({"automations": [_automation_public(row) for row in rows]}), 200
+
+
+@bp.post("/automations")
+def create_automation():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    keyword = _normalize_keyword(payload.get("keyword"))
+    if len(keyword) < 2:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Keyword must be 2-40 characters."}}), 400
+    action_type = payload.get("action_type", payload.get("actionType"))
+    if action_type not in AUTOMATION_ACTION_TYPES:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Action must be add_tag or assign."}}), 400
+    if action_type == "add_tag":
+        action_value = _clean_tag(payload.get("action_value",
+                                              payload.get("actionValue")))
+        if not action_value:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "Label value is required."}}), 400
+    else:
+        action_value = str(payload.get("action_value",
+                                       payload.get("actionValue")) or "").strip().lower()[:120]
+        if not action_value:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "Assignee email is required."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                if action_type == "assign":
+                    cur.execute(
+                        "SELECT 1 FROM " + portal_db._q(portal_db.TEAM_TABLE) +
+                        " WHERE client_id = %s AND email = %s"
+                        " AND status = 'active' LIMIT 1",
+                        (principal["client_id"], action_value),
+                    )
+                    if not portal_db.rows(cur):
+                        return jsonify({"error": {"code": "assignee_not_found",
+                                                  "message": "Assignee must be an active team member."}}), 400
+                cur.execute(
+                    "SELECT COUNT(*) AS total FROM "
+                    + portal_db._q(AUTOMATIONS_TABLE) +
+                    " WHERE client_id = %s",
+                    (principal["client_id"],),
+                )
+                counts = portal_db.rows(cur)
+                if counts and int(counts[0].get("total") or 0) >= MAX_AUTOMATIONS:
+                    return jsonify({"error": {"code": "limit_reached",
+                                              "message": "Up to 20 automations."}}), 409
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(AUTOMATIONS_TABLE) +
+                    " WHERE client_id = %s AND keyword = %s"
+                    " AND action_type = %s AND LOWER(action_value) = LOWER(%s)"
+                    " LIMIT 1",
+                    (principal["client_id"], keyword, action_type, action_value),
+                )
+                if portal_db.rows(cur):
+                    return jsonify({"error": {"code": "duplicate",
+                                              "message": "A rule with this keyword and action already exists."}}), 409
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(AUTOMATIONS_TABLE) +
+                    " (client_id, keyword, action_type, action_value,"
+                    " is_active, times_triggered, created_at, updated_at)"
+                    " VALUES (%s, %s, %s, %s, TRUE, 0, NOW(), NOW())"
+                    " RETURNING id, keyword, action_type, action_value,"
+                    " is_active, times_triggered, created_at",
+                    (principal["client_id"], keyword, action_type, action_value),
+                )
+                inserted = portal_db.rows(cur)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "automation.created",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Automation added: " + keyword
+                     + " -> " + action_type + " " + action_value)[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "automation create")[0]), 503
+    if not inserted:
+        return jsonify({"error": {"code": "portal_unavailable",
+                                  "message": "Try again shortly."}}), 503
+    return jsonify({"ok": True, "automation": _automation_public(inserted[0])}), 200
+
+
+@bp.patch("/automations/<int:rule_id>")
+def update_automation(rule_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    is_active = payload.get("is_active", payload.get("isActive"))
+    if not isinstance(is_active, bool):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "is_active must be true or false."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(AUTOMATIONS_TABLE) +
+                    " SET is_active = %s, updated_at = NOW()"
+                    " WHERE id = %s AND client_id = %s"
+                    " RETURNING keyword",
+                    (is_active, rule_id, principal["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+                if not updated:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Automation not found."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "automation.updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Automation " + ("enabled: " if is_active else "disabled: ")
+                    + str(updated[0].get("keyword") or ""),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "automation update")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
+@bp.delete("/automations/<int:rule_id>")
+def delete_automation(rule_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM " + portal_db._q(AUTOMATIONS_TABLE) +
+                    " WHERE id = %s AND client_id = %s RETURNING keyword",
+                    (rule_id, principal["client_id"]),
+                )
+                deleted = portal_db.rows(cur)
+                if not deleted:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Automation not found."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "automation.deleted",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Automation deleted: " + str(deleted[0].get("keyword") or ""),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "automation delete")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
+
+
 
