@@ -324,6 +324,12 @@ CREATE TABLE IF NOT EXISTS portal_saved_replies (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_saved_replies
   ON portal_saved_replies (client_id, id DESC);
+ALTER TABLE portal_widget_settings
+  ADD COLUMN IF NOT EXISTS accent TEXT NOT NULL DEFAULT '#22d3ee';
+ALTER TABLE portal_widget_settings
+  ADD COLUMN IF NOT EXISTS position TEXT NOT NULL DEFAULT 'right';
+ALTER TABLE portal_widget_settings
+  ADD COLUMN IF NOT EXISTS launcher_label TEXT NOT NULL DEFAULT '';
 """
 
 

@@ -44,7 +44,8 @@ def _widget_client(cur) -> Optional[Dict[str, Any]]:
     """The widget settings singleton (row id = 1), seeded lazily from the
     first registered workspace so the widget works with zero setup."""
     cur.execute(
-        "SELECT client_id, enabled, business_name, welcome_text FROM "
+        "SELECT client_id, enabled, business_name, welcome_text,"
+        " accent, position, launcher_label FROM "
         + portal_db._q(WIDGET_TABLE) + " WHERE id = 1 LIMIT 1"
     )
     rows = portal_db.rows(cur)
@@ -60,13 +61,15 @@ def _widget_client(cur) -> Optional[Dict[str, Any]]:
         return None
     cur.execute(
         "INSERT INTO " + portal_db._q(WIDGET_TABLE) +
-        " (id, client_id, enabled, business_name, welcome_text)"
-        " VALUES (1, %s, TRUE, '', %s)"
+        " (id, client_id, enabled, business_name, welcome_text,"
+        " accent, position, launcher_label)"
+        " VALUES (1, %s, TRUE, '', %s, %s, 'right', '')"
         " ON CONFLICT (id) DO NOTHING",
-        (client_id, DEFAULT_WELCOME),
+        (client_id, DEFAULT_WELCOME, DEFAULT_ACCENT),
     )
     cur.execute(
-        "SELECT client_id, enabled, business_name, welcome_text FROM "
+        "SELECT client_id, enabled, business_name, welcome_text,"
+        " accent, position, launcher_label FROM "
         + portal_db._q(WIDGET_TABLE) + " WHERE id = 1 LIMIT 1"
     )
     rows = portal_db.rows(cur)
@@ -162,6 +165,11 @@ def widget_config():
         "enabled": True,
         "business_name": str(cfg.get("business_name") or ""),
         "welcome_text": str(cfg.get("welcome_text") or "") or DEFAULT_WELCOME,
+        "accent": str(cfg.get("accent") or DEFAULT_ACCENT),
+        "position": cfg.get("position")
+        if cfg.get("position") in WIDGET_POSITIONS
+        else "right",
+        "launcher_label": str(cfg.get("launcher_label") or ""),
     }), 200
 
 
@@ -319,6 +327,10 @@ from portal_auth import (
 
 MAX_BUSINESS_NAME = 80
 MAX_WELCOME_TEXT = 200
+DEFAULT_ACCENT = "#22d3ee"
+WIDGET_POSITIONS = ("left", "right")
+MAX_LAUNCHER_LABEL = 24
+DEFAULT_LAUNCHER_LABEL = "Chat with us"
 
 
 def _settings_public(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -326,6 +338,11 @@ def _settings_public(row: Dict[str, Any]) -> Dict[str, Any]:
         "enabled": row.get("enabled") is True,
         "business_name": str(row.get("business_name") or ""),
         "welcome_text": str(row.get("welcome_text") or ""),
+        "accent": str(row.get("accent") or DEFAULT_ACCENT),
+        "position": row.get("position")
+        if row.get("position") in WIDGET_POSITIONS
+        else "right",
+        "launcher_label": str(row.get("launcher_label") or ""),
     }
 
 
@@ -384,6 +401,20 @@ def portal_widget_settings_put():
     if len(welcome_text) > MAX_WELCOME_TEXT:
         return jsonify({"error": {"code": "bad_request",
                                   "message": "Welcome text must be 200 characters or fewer."}}), 400
+    accent = str(payload.get("accent") or "").strip().lower()
+    if not accent:
+        accent = DEFAULT_ACCENT
+    if not re.match(r"^#[0-9a-f]{6}$", accent):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Accent must be a hex colour like #22d3ee."}}), 400
+    position = str(payload.get("position") or "right").strip().lower()
+    if position not in WIDGET_POSITIONS:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Position must be left or right."}}), 400
+    launcher_label = re.sub(r"\s+", " ", str(payload.get("launcher_label") or "").strip())
+    if len(launcher_label) > MAX_LAUNCHER_LABEL:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Launcher label must be 24 characters or fewer."}}), 400
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
@@ -396,8 +427,10 @@ def portal_widget_settings_put():
                 cur.execute(
                     "UPDATE " + portal_db._q(WIDGET_TABLE) +
                     " SET enabled = %s, business_name = %s, welcome_text = %s,"
+                    " accent = %s, position = %s, launcher_label = %s,"
                     " updated_at = NOW() WHERE id = 1",
-                    (enabled, business_name, welcome_text),
+                    (enabled, business_name, welcome_text, accent, position,
+                     launcher_label),
                 )
                 portal_db.log_action(
                     cur,
@@ -417,5 +450,8 @@ def portal_widget_settings_put():
         "enabled": enabled,
         "business_name": business_name,
         "welcome_text": welcome_text,
+        "accent": accent,
+        "position": position,
+        "launcher_label": launcher_label,
     }}), 200
 
