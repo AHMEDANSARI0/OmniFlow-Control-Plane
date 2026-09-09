@@ -858,3 +858,113 @@ def export_conversations():
 
 
 
+# ---------------------------------------------------------------------------
+# Customers (contacts aggregated across all their conversations)
+# ---------------------------------------------------------------------------
+
+CUSTOMERS_LIMIT = 100
+WARM_LEAD_SCORE = 35
+
+
+@bp.get("/customers")
+def list_customers():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    search = (request.args.get("q") or "").strip()[:100]
+    channel_filter = (request.args.get("channel") or "").strip().lower()
+
+    sql = (
+        "SELECT c.contact_id,"
+        " COALESCE(MAX(c.contact_name), '') AS contact_name,"
+        " COUNT(*) AS conversation_count,"
+        " COUNT(*) FILTER (WHERE c.status = 'open') AS open_count,"
+        " MAX(c.last_message_at) AS last_message_at,"
+        " MAX(c.last_message_preview) AS last_message_preview,"
+        " STRING_AGG(DISTINCT c.channel, ',') AS channels,"
+        " BOOL_OR(c.lead_temp = 'hot') AS has_hot,"
+        " MAX(c.lead_score) AS max_lead_score"
+        " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+        " WHERE c.client_id = %s"
+    )
+    params = [principal["client_id"]]
+    if channel_filter in ("whatsapp", "website"):
+        sql += " AND c.channel = %s"
+        params.append(channel_filter)
+    if search:
+        like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        sql += (
+            " GROUP BY c.contact_id"
+            " HAVING (COALESCE(MAX(c.contact_name), '') ILIKE %s"
+            " OR c.contact_id ILIKE %s)"
+        )
+        params.extend([like, like])
+    else:
+        sql += " GROUP BY c.contact_id"
+    sql += (
+        " ORDER BY MAX(c.last_message_at) DESC NULLS LAST, c.contact_id"
+        " LIMIT %s"
+    )
+    params.append(CUSTOMERS_LIMIT)
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                found = portal_db.rows(cur)
+                contact_ids = [row.get("contact_id") for row in found]
+                tags_map = {}
+                if contact_ids:
+                    cur.execute(
+                        "SELECT conv.contact_id, ct.tag FROM "
+                        + portal_db._q(portal_db.CONV_TAGS_TABLE) + " ct"
+                        " JOIN " + portal_db._q(portal_db.CONV_TABLE) + " conv"
+                        " ON conv.id = ct.conversation_id"
+                        " WHERE ct.client_id = %s AND conv.client_id = %s"
+                        " AND conv.contact_id = ANY(%s) ORDER BY ct.id",
+                        (principal["client_id"], principal["client_id"],
+                         contact_ids),
+                    )
+                    for row in portal_db.rows(cur):
+                        key = row.get("contact_id")
+                        tag = str(row.get("tag") or "")
+                        if key is None or not tag:
+                            continue
+                        bucket = tags_map.setdefault(key, [])
+                        if tag not in bucket:
+                            bucket.append(tag)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customers read")[0]), 503
+
+    customers = []
+    for row in found:
+        max_score = int(row.get("max_lead_score") or 0)
+        if row.get("has_hot"):
+            lead_temp = "hot"
+        elif max_score >= WARM_LEAD_SCORE:
+            lead_temp = "warm"
+        else:
+            lead_temp = "cold"
+        customers.append({
+            "contact_id": row.get("contact_id"),
+            "name": str(row.get("contact_name") or ""),
+            "channels": [
+                part for part in str(row.get("channels") or "").split(",") if part
+            ],
+            "conversation_count": int(row.get("conversation_count") or 0),
+            "open_count": int(row.get("open_count") or 0),
+            "last_message_at": _iso(row.get("last_message_at")),
+            "last_message_preview": row.get("last_message_preview"),
+            "lead_temp": lead_temp,
+            "tags": tags_map.get(row.get("contact_id"), []),
+        })
+    return jsonify({"customers": customers}), 200
+
+
+
+
