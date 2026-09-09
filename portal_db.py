@@ -37,6 +37,7 @@ GAPS_TABLE = os.environ.get("OF_GAPS_TABLE", "portal_kb_gaps")
 CSAT_TABLE = os.environ.get("OF_CSAT_TABLE", "portal_csat_requests")
 WIDGET_TABLE = os.environ.get("OF_WIDGET_TABLE", "portal_widget_settings")
 CONV_TAGS_TABLE = os.environ.get("OF_CONVTAGS_TABLE", "portal_conversation_tags")
+SAVED_REPLIES_TABLE = os.environ.get("OF_SAVEDREPLIES_TABLE", "portal_saved_replies")
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -313,6 +314,16 @@ CREATE TABLE IF NOT EXISTS portal_conversation_tags (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_conv_tags_conv
   ON portal_conversation_tags (conversation_id, id);
+CREATE TABLE IF NOT EXISTS portal_saved_replies (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  shortcut TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT uq_portal_saved_reply UNIQUE (client_id, shortcut)
+);
+CREATE INDEX IF NOT EXISTS idx_portal_saved_replies
+  ON portal_saved_replies (client_id, id DESC);
 """
 
 

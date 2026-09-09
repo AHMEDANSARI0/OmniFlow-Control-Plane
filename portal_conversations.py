@@ -603,3 +603,175 @@ def remove_conversation_tag(conversation_id: int):
         return jsonify(portal_db.portal_unavailable(error, "label remove")[0]), 503
     return jsonify({"ok": True}), 200
 
+
+
+# ---------------------------------------------------------------------------
+# Saved replies (canned response templates for the shared inbox)
+# ---------------------------------------------------------------------------
+
+MAX_SAVED_REPLIES = 30
+MAX_REPLY_BODY = 1000
+SHORTCUT_RE = re.compile(r"^[a-z0-9_-]{1,24}$")
+
+
+def _clean_shortcut(value: Any) -> str:
+    """Normalize a shortcut: trim, drop a leading slash, lowercase, cap 24."""
+    if not isinstance(value, str):
+        return ""
+    shortcut = value.strip()
+    while shortcut.startswith("/"):
+        shortcut = shortcut[1:]
+    shortcut = re.sub(r"\s+", "-", shortcut.strip().lower())
+    shortcut = shortcut[:24]
+    if not SHORTCUT_RE.match(shortcut):
+        return ""
+    return shortcut
+
+
+@bp.get("/saved-replies")
+def list_saved_replies():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, shortcut, body, created_at FROM "
+                    + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " WHERE client_id = %s ORDER BY id DESC LIMIT %s",
+                    (principal["client_id"], MAX_SAVED_REPLIES),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "saved replies read")[0]), 503
+    return jsonify({"replies": [
+        {
+            "id": int(row.get("id") or 0),
+            "shortcut": str(row.get("shortcut") or ""),
+            "body": str(row.get("body") or ""),
+            "created_at": _iso(row.get("created_at")),
+        }
+        for row in rows
+    ]}), 200
+
+
+@bp.post("/saved-replies")
+def create_saved_reply():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    shortcut = _clean_shortcut(payload.get("shortcut"))
+    if not shortcut:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Shortcut can use letters, numbers, dashes and underscores (max 24)."}}), 400
+    body_text = payload.get("body")
+    body_text = body_text.strip() if isinstance(body_text, str) else ""
+    if not body_text:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message text is required."}}), 400
+    if len(body_text) > MAX_REPLY_BODY:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message must be 1000 characters or fewer."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS total FROM "
+                    + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " WHERE client_id = %s",
+                    (principal["client_id"],),
+                )
+                counts = portal_db.rows(cur)
+                if counts and int(counts[0].get("total") or 0) >= MAX_SAVED_REPLIES:
+                    return jsonify({"error": {"code": "limit_reached",
+                                              "message": "Up to 30 saved replies per workspace."}}), 409
+                cur.execute(
+                    "SELECT id FROM " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " WHERE client_id = %s AND LOWER(shortcut) = LOWER(%s) LIMIT 1",
+                    (principal["client_id"], shortcut),
+                )
+                if portal_db.rows(cur):
+                    return jsonify({"error": {"code": "duplicate",
+                                              "message": "A reply with this shortcut already exists."}}), 409
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " (client_id, shortcut, body, created_at)"
+                    " VALUES (%s, %s, %s, NOW()) RETURNING id, shortcut, body, created_at",
+                    (principal["client_id"], shortcut, body_text),
+                )
+                inserted = portal_db.rows(cur)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "saved_reply.created",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Saved reply added: /" + shortcut)[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "saved reply create")[0]), 503
+    created = inserted[0] if inserted else {}
+    return jsonify({"ok": True, "reply": {
+        "id": int(created.get("id") or 0),
+        "shortcut": str(created.get("shortcut") or shortcut),
+        "body": str(created.get("body") or body_text),
+        "created_at": _iso(created.get("created_at")),
+    }}), 200
+
+
+@bp.delete("/saved-replies/<int:reply_id>")
+def delete_saved_reply(reply_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " WHERE id = %s AND client_id = %s RETURNING shortcut",
+                    (reply_id, principal["client_id"]),
+                )
+                deleted = portal_db.rows(cur)
+                if not deleted:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Saved reply not found."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "saved_reply.deleted",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Saved reply deleted: /"
+                     + str(deleted[0].get("shortcut") or ""))[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "saved reply delete")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
