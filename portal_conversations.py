@@ -775,3 +775,86 @@ def delete_saved_reply(reply_id: int):
     return jsonify({"ok": True}), 200
 
 
+
+# ---------------------------------------------------------------------------
+# Conversation export (CSV download source — same filters as the list)
+# ---------------------------------------------------------------------------
+
+EXPORT_LIMIT = 500
+
+
+@bp.get("/conversations/export")
+def export_conversations():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    status = (request.args.get("status") or "all").strip().lower()
+    if status not in ALLOWED_STATUS:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "status must be all, open, or closed."}}), 400
+    search = (request.args.get("q") or "").strip()[:100]
+    intent_filter = (request.args.get("intent") or "").strip().lower()
+    channel_filter = (request.args.get("channel") or "").strip().lower()
+    tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
+
+    sql = (
+        "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
+        " c.last_message_at, c.last_message_preview, c.created_at, c.last_intent,"
+        " c.lead_score, c.lead_temp, c.assigned_to, tm.name AS assignee_name"
+        " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+        " LEFT JOIN " + portal_db._q(portal_db.TEAM_TABLE) + " tm"
+        " ON tm.client_id = c.client_id AND tm.email = c.assigned_to"
+        " WHERE c.client_id = %s"
+    )
+    params = [principal["client_id"]]
+    if status != "all":
+        sql += " AND c.status = %s"
+        params.append(status)
+    if intent_filter and intent_filter != "all":
+        sql += " AND c.last_intent = %s"
+        params.append(intent_filter[:40])
+    if channel_filter in ("whatsapp", "website"):
+        sql += " AND c.channel = %s"
+        params.append(channel_filter)
+    if tag_filter:
+        sql += (
+            " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+            " ct WHERE ct.conversation_id = c.id AND ct.client_id = c.client_id"
+            " AND LOWER(ct.tag) = LOWER(%s))"
+        )
+        params.append(tag_filter)
+    if search:
+        like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+        sql += (
+            " AND (c.contact_name ILIKE %s OR c.contact_id ILIKE %s"
+            " OR EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " sm WHERE sm.conversation_id = c.id AND sm.body ILIKE %s))"
+        )
+        params.extend([like, like, like])
+    sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
+    params.append(EXPORT_LIMIT)
+
+    tags_map = {}
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                found = portal_db.rows(cur)
+                tags_map = _tags_map(cur, principal["client_id"],
+                                     [row.get("id") for row in found])
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "conversations export")[0]), 503
+
+    rows = []
+    for row in found:
+        item = _conversation_public(row)
+        item["tags"] = tags_map.get(row.get("id"), [])
+        rows.append(item)
+    return jsonify({"conversations": rows, "count": len(rows)}), 200
+
+
+
