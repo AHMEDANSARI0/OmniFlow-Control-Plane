@@ -304,3 +304,118 @@ def widget_poll():
         "conversation_id": conversation_id,
         "messages": [_message_public(m) for m in messages],
     }), 200
+
+
+
+# ---------------------------------------------------------------------------
+# Portal-side widget settings (authenticated humans; API keys stay read-only)
+# ---------------------------------------------------------------------------
+
+from portal_auth import (
+    PortalAuthUnavailable,
+    authenticate_portal_request,
+    ensure_human_principal,
+)
+
+MAX_BUSINESS_NAME = 80
+MAX_WELCOME_TEXT = 200
+
+
+def _settings_public(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "enabled": row.get("enabled") is True,
+        "business_name": str(row.get("business_name") or ""),
+        "welcome_text": str(row.get("welcome_text") or ""),
+    }
+
+
+def _principal_or_error():
+    try:
+        principal = authenticate_portal_request()
+    except PortalAuthUnavailable as error:
+        return None, (jsonify({"error": {"code": "portal_unavailable",
+                                         "message": str(error)}}), 503)
+    if principal is None:
+        return None, (jsonify({"error": {"code": "unauthorized",
+                                         "message": "Sign in required."}}), 401)
+    return principal, None
+
+
+@bp.get("/portal/widget/settings")
+def portal_widget_settings_get():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cfg = _widget_client(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "widget settings")[0]), 503
+    if not cfg or cfg.get("client_id") is None:
+        return jsonify({"error": {"code": "no_workspace",
+                                  "message": "No workspace found."}}), 400
+    return jsonify({"settings": _settings_public(cfg)}), 200
+
+
+@bp.put("/portal/widget/settings")
+def portal_widget_settings_put():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "enabled must be true or false."}}), 400
+    business_name = re.sub(r"\s+", " ", str(payload.get("business_name") or "").strip())
+    if len(business_name) > MAX_BUSINESS_NAME:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Business name must be 80 characters or fewer."}}), 400
+    welcome_text = str(payload.get("welcome_text") or "").strip()
+    if len(welcome_text) > MAX_WELCOME_TEXT:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Welcome text must be 200 characters or fewer."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cfg = _widget_client(cur)
+                if not cfg or cfg.get("client_id") is None:
+                    return jsonify({"error": {"code": "no_workspace",
+                                              "message": "No workspace found."}}), 400
+                cur.execute(
+                    "UPDATE " + portal_db._q(WIDGET_TABLE) +
+                    " SET enabled = %s, business_name = %s, welcome_text = %s,"
+                    " updated_at = NOW() WHERE id = 1",
+                    (enabled, business_name, welcome_text),
+                )
+                portal_db.log_action(
+                    cur,
+                    cfg["client_id"],
+                    "widget.updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Website widget " + ("enabled." if enabled else "disabled."),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "widget settings update")[0]), 503
+    return jsonify({"ok": True, "settings": {
+        "enabled": enabled,
+        "business_name": business_name,
+        "welcome_text": welcome_text,
+    }}), 200
+

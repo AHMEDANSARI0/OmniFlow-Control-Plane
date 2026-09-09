@@ -134,6 +134,10 @@ def list_conversations():
     if intent_filter and intent_filter != "all":
         sql += " AND c.last_intent = %s"
         params.append(intent_filter[:40])
+    channel_filter = (request.args.get("channel") or "").strip().lower()
+    if channel_filter in ("whatsapp", "website"):
+        sql += " AND c.channel = %s"
+        params.append(channel_filter)
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
