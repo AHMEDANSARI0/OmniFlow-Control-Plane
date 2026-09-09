@@ -20,6 +20,7 @@ for both human sessions and portal API keys (ofk_ — read-only anyway).
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -91,6 +92,39 @@ def _message_public(row: Any) -> dict:
     }
 
 
+MAX_TAGS_PER_CONVERSATION = 6
+MAX_TAG_LENGTH = 24
+MAX_TAG_SUMMARY = 30
+
+
+def _clean_tag(value: Any) -> str:
+    """Collapse whitespace and cap the length; empty string when unusable."""
+    if not isinstance(value, str):
+        return ""
+    cleaned = re.sub(r"\s+", " ", value).strip()
+    if not cleaned:
+        return ""
+    return cleaned[:MAX_TAG_LENGTH]
+
+
+def _tags_map(cur, client_id, conversation_ids) -> dict:
+    """Return {conversation_id: [tag, ...]} for the given conversations."""
+    ids = [int(cid) for cid in conversation_ids if cid is not None]
+    if not ids:
+        return {}
+    cur.execute(
+        "SELECT id, conversation_id, tag FROM " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+        " WHERE client_id = %s AND conversation_id = ANY(%s) ORDER BY id",
+        (client_id, ids),
+    )
+    mapping = {}
+    for row in portal_db.rows(cur):
+        mapping.setdefault(row.get("conversation_id"), []).append(
+            str(row.get("tag") or "")
+        )
+    return mapping
+
+
 @bp.get("/conversations")
 def list_conversations():
     principal, error = _principal_or_error()
@@ -138,6 +172,14 @@ def list_conversations():
     if channel_filter in ("whatsapp", "website"):
         sql += " AND c.channel = %s"
         params.append(channel_filter)
+    tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
+    if tag_filter:
+        sql += (
+            " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+            " ct WHERE ct.conversation_id = c.id AND ct.client_id = c.client_id"
+            " AND LOWER(ct.tag) = LOWER(%s))"
+        )
+        params.append(tag_filter)
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
@@ -149,6 +191,7 @@ def list_conversations():
     sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
     params.append(limit)
 
+    tags_map = {}
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
@@ -156,12 +199,19 @@ def list_conversations():
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
                 found = portal_db.rows(cur)
+                tags_map = _tags_map(cur, principal["client_id"],
+                                     [row.get("id") for row in found])
         finally:
             conn.close()
     except Exception as error:
         return jsonify(portal_db.portal_unavailable(error, "conversations read")[0]), 503
 
-    return jsonify({"conversations": [_conversation_public(r) for r in found]}), 200
+    conversations = []
+    for row in found:
+        item = _conversation_public(row)
+        item["tags"] = tags_map.get(row.get("id"), [])
+        conversations.append(item)
+    return jsonify({"conversations": conversations}), 200
 
 
 @bp.get("/conversations/<int:conversation_id>")
@@ -198,6 +248,9 @@ def conversation_detail(conversation_id: int):
                     (conversation_id, MESSAGE_PAGE_SIZE),
                 )
                 msgs = portal_db.rows(cur)
+                detail_tags = _tags_map(
+                    cur, principal["client_id"], [conversation_id]
+                ).get(conversation_id, [])
                 cur.execute(
                     "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
                     " SET last_read_at = NOW()"
@@ -210,8 +263,10 @@ def conversation_detail(conversation_id: int):
     except Exception as error:
         return jsonify(portal_db.portal_unavailable(error, "conversation detail")[0]), 503
 
+    conversation_public = _conversation_public(found[0])
+    conversation_public["tags"] = detail_tags
     return jsonify({
-        "conversation": _conversation_public(found[0]),
+        "conversation": conversation_public,
         "messages": [_message_public(m) for m in reversed(msgs)],
     }), 200
 
@@ -406,3 +461,145 @@ def enqueue_conversation_message(conversation_id: int):
     )
     return jsonify({"ok": True, "queued": True,
                     "command_id": inserted[0].get("id") if inserted else None}), 200
+
+
+
+# ---------------------------------------------------------------------------
+# Conversation tags (labels) — organize and filter the shared inbox
+# ---------------------------------------------------------------------------
+
+@bp.get("/conversations/tags/summary")
+def conversation_tags_summary():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT tag, COUNT(*) AS uses FROM "
+                    + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+                    " WHERE client_id = %s GROUP BY tag"
+                    " ORDER BY uses DESC, tag LIMIT %s",
+                    (principal["client_id"], MAX_TAG_SUMMARY),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "tag summary")[0]), 503
+    return jsonify({"tags": [
+        {"tag": str(row.get("tag") or ""), "count": int(row.get("uses") or 0)}
+        for row in rows
+    ]}), 200
+
+
+@bp.post("/conversations/<int:conversation_id>/tags")
+def add_conversation_tag(conversation_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    tag = _clean_tag(payload.get("tag"))
+    if not tag:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Label text is required."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE id = %s AND client_id = %s LIMIT 1",
+                    (conversation_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Conversation not found."}}), 404
+                cur.execute(
+                    "SELECT id, tag FROM " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+                    " WHERE client_id = %s AND conversation_id = %s ORDER BY id",
+                    (principal["client_id"], conversation_id),
+                )
+                existing = portal_db.rows(cur)
+                if any(str(row.get("tag") or "").lower() == tag.lower()
+                       for row in existing):
+                    return jsonify({"ok": True, "duplicate": True, "tag": tag}), 200
+                if len(existing) >= MAX_TAGS_PER_CONVERSATION:
+                    return jsonify({"error": {"code": "limit_reached",
+                                              "message": "Up to 6 labels per conversation."}}), 409
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+                    " (client_id, conversation_id, tag, created_at)"
+                    " VALUES (%s, %s, %s, NOW()) RETURNING id",
+                    (principal["client_id"], conversation_id, tag),
+                )
+                inserted = portal_db.rows(cur)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "tag.added",
+                    "customer_user",
+                    principal.get("user_id"),
+                    conversation_id,
+                    ("Label added: " + tag)[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "label add")[0]), 503
+    return jsonify({"ok": True, "duplicate": False, "tag": tag,
+                    "id": inserted[0].get("id") if inserted else None}), 200
+
+
+@bp.delete("/conversations/<int:conversation_id>/tags")
+def remove_conversation_tag(conversation_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    tag = _clean_tag(request.args.get("tag"))
+    if not tag:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Label text is required."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM " + portal_db._q(portal_db.CONV_TAGS_TABLE) +
+                    " WHERE conversation_id = %s AND client_id = %s"
+                    " AND LOWER(tag) = LOWER(%s) RETURNING id, tag",
+                    (conversation_id, principal["client_id"], tag),
+                )
+                deleted = portal_db.rows(cur)
+                if not deleted:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Label not found."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "tag.removed",
+                    "customer_user",
+                    principal.get("user_id"),
+                    conversation_id,
+                    ("Label removed: " + str(deleted[0].get("tag") or ""))[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "label remove")[0]), 503
+    return jsonify({"ok": True}), 200
+
