@@ -1849,6 +1849,83 @@ def delete_customer_note(note_id: int):
     return jsonify({"ok": True}), 200
 
 
+@bp.post("/customers/message")
+def send_customer_message():
+    """Queue one WhatsApp message to a contact from the customers page."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    contact_id = payload.get("contact_id")
+    contact_id = contact_id.strip()[:120] if isinstance(contact_id, str) else ""
+    body = payload.get("body")
+    body = body.strip() if isinstance(body, str) else ""
+    if not contact_id:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "contact_id is required."}}), 400
+    if not body:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Write the message first."}}), 400
+    if len(body) > 1000:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message must be 1000 characters or fewer."}}), 400
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, contact_name FROM "
+                    + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND contact_id = %s"
+                    " AND channel = 'whatsapp'"
+                    " ORDER BY id DESC LIMIT 1",
+                    (client_id, contact_id),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    return jsonify({"error": {"code": "contact_not_found",
+                                              "message": "No WhatsApp chat exists for this contact."}}), 404
+                display = str(rows[0].get("contact_name") or "").strip()
+                message_payload = {
+                    "external_user_id": contact_id,
+                    "body": body[:1000],
+                    "source": "manual",
+                }
+                if display:
+                    message_payload["target_display_name"] = display
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
+                    " (client_id, channel, action, payload, status, requested_by,"
+                    " created_at, updated_at) "
+                    "VALUES (%s, 'whatsapp', 'send_message', CAST(%s AS JSONB),"
+                    " 'pending', %s, NOW(), NOW()) "
+                    "RETURNING id",
+                    (client_id, json.dumps(message_payload), principal.get("user_id")),
+                )
+                inserted = portal_db.rows(cur)
+                command_id = int(inserted[0].get("id") or 0) if inserted else 0
+                portal_db.log_action(
+                    cur,
+                    client_id,
+                    "message.manual_queued",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Manual message queued for " + contact_id + ".",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "manual message")[0]), 503
+    return jsonify({"ok": True, "command_id": command_id}), 200
+
+
 
 
 
