@@ -146,6 +146,41 @@ def get_analytics():
                     (client_id,),
                 )
                 entry_rows = portal_db.rows(cur)
+
+                cur.execute(
+                    "SELECT COUNT(*) AS created,"
+                    " COUNT(*) FILTER (WHERE status = 'closed') AS closed"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s"
+                    " AND created_at > NOW() - make_interval(days => %s)",
+                    (client_id, days),
+                )
+                service_rows = portal_db.rows(cur)
+
+                cur.execute(
+                    "SELECT AVG(EXTRACT(EPOCH FROM (t.out_ts - t.first_in)))"
+                    " AS avg_seconds,"
+                    " PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY"
+                    " EXTRACT(EPOCH FROM (t.out_ts - t.first_in)))"
+                    " AS median_seconds,"
+                    " COUNT(*) AS answered"
+                    " FROM ("
+                    " SELECT i.conversation_id, i.first_in,"
+                    " (SELECT MIN(o.created_at) FROM "
+                    + portal_db._q(portal_db.MSGS_TABLE) +
+                    " o WHERE o.conversation_id = i.conversation_id"
+                    " AND o.direction = 'out'"
+                    " AND o.created_at > i.first_in) AS out_ts"
+                    " FROM (SELECT conversation_id, MIN(created_at) AS first_in"
+                    " FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+                    " WHERE client_id = %s AND direction = 'in'"
+                    " AND created_at > NOW() - make_interval(days => %s)"
+                    " GROUP BY conversation_id) i"
+                    " ) t"
+                    " WHERE t.out_ts IS NOT NULL",
+                    (client_id, days),
+                )
+                frt_rows = portal_db.rows(cur)
             conn.commit()
         finally:
             conn.close()
@@ -186,6 +221,27 @@ def get_analytics():
     }
     delivered = int((delivered_rows[0].get("c") if delivered_rows else 0) or 0)
 
+    service_row = service_rows[0] if service_rows else {}
+    window_created = int(service_row.get("created") or 0)
+    window_closed = int(service_row.get("closed") or 0)
+    resolution_rate = (
+        round(window_closed / window_created * 100, 1)
+        if window_created > 0 else None
+    )
+    frt_row = frt_rows[0] if frt_rows else {}
+    frt_answered = int(frt_row.get("answered") or 0)
+
+    def _round_seconds(value):
+        if value is None:
+            return None
+        try:
+            return round(float(value), 1)
+        except (TypeError, ValueError):
+            return None
+
+    frt_avg = _round_seconds(frt_row.get("avg_seconds")) if frt_answered else None
+    frt_median = _round_seconds(frt_row.get("median_seconds")) if frt_answered else None
+
     intents = [
         {"intent": str(row.get("intent") or ""), "count": int(row.get("c") or 0)}
         for row in intent_rows
@@ -214,6 +270,12 @@ def get_analytics():
             "instant_answers": automation.get("kb.auto_reply", 0),
             "followups_delivered": delivered,
             "replies_queued": automation.get("message.enqueued", 0),
+        },
+        "service": {
+            "resolution_rate": resolution_rate,
+            "frt_avg_seconds": frt_avg,
+            "frt_median_seconds": frt_median,
+            "answered_conversations": frt_answered,
         },
         "per_day": per_day,
         "intents": intents,
