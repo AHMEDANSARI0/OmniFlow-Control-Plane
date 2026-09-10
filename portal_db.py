@@ -42,6 +42,7 @@ AUTOMATIONS_TABLE = os.environ.get("OF_AUTOMATIONS_TABLE", "portal_automations")
 AUTOMATION_SETTINGS_TABLE = os.environ.get(
     "OF_AUTOMSETTINGS_TABLE", "portal_automation_settings"
 )
+CUSTOMER_NOTES_TABLE = os.environ.get("OF_CUSTNOTES_TABLE", "portal_customer_notes")
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -321,6 +322,17 @@ ALTER TABLE portal_automation_settings
   ADD COLUMN IF NOT EXISTS close_after_hours INT NOT NULL DEFAULT 48;
 ALTER TABLE portal_automation_settings
   ADD COLUMN IF NOT EXISTS assign_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS portal_customer_notes (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  contact_id TEXT NOT NULL,
+  body TEXT NOT NULL,
+  author_email TEXT,
+  author_name TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_customer_notes
+  ON portal_customer_notes (client_id, contact_id, id DESC);
 CREATE TABLE IF NOT EXISTS portal_conversation_tags (
   id BIGSERIAL PRIMARY KEY,
   client_id BIGINT NOT NULL,

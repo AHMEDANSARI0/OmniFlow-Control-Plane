@@ -1698,9 +1698,155 @@ def auto_assign_new_chat(client_id, conversation_id, conn):
             "system",
             None,
             conversation_id,
-            "Auto-assigned to " + email + " (least loaded).",
+                "Auto-assigned to " + email + " (least loaded).",
         )
     return email
+
+
+# ---------------------------------------------------------------------------
+# Customer notes (contact-level CRM notes)
+# ---------------------------------------------------------------------------
+
+def _customer_note_public(row: Any) -> dict:
+    return {
+        "id": row.get("id"),
+        "body": row.get("body"),
+        "author_email": row.get("author_email"),
+        "author_name": row.get("author_name"),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+@bp.get("/customers/notes")
+def list_customer_notes():
+    """Latest 50 notes for one contact, newest first."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    contact_id = (request.args.get("contact_id") or "").strip()[:120]
+    if not contact_id:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "contact_id is required."}}), 400
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, body, author_email, author_name, created_at"
+                    " FROM " + portal_db._q(portal_db.CUSTOMER_NOTES_TABLE) +
+                    " WHERE client_id = %s AND contact_id = %s"
+                    " ORDER BY id DESC LIMIT 50",
+                    (client_id, contact_id),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customer notes read")[0]), 503
+    return jsonify({
+        "ok": True,
+        "notes": [_customer_note_public(row) for row in rows],
+    }), 200
+
+
+@bp.post("/customers/notes")
+def add_customer_note():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    contact_id = payload.get("contact_id")
+    contact_id = contact_id.strip()[:120] if isinstance(contact_id, str) else ""
+    if not contact_id:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "contact_id is required."}}), 400
+    body = payload.get("body")
+    body = body.strip() if isinstance(body, str) else ""
+    if not body:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Write the note first."}}), 400
+    if len(body) > 1000:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Note must be 1000 characters or fewer."}}), 400
+    author_email = str(principal.get("email") or "").strip().lower()[:120]
+    author_name = str(principal.get("display_name") or "").strip()[:80]
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(portal_db.CUSTOMER_NOTES_TABLE) +
+                    " (client_id, contact_id, body, author_email, author_name)"
+                    " VALUES (%s, %s, %s, %s, %s)"
+                    " RETURNING id, body, author_email, author_name, created_at",
+                    (client_id, contact_id, body, author_email, author_name),
+                )
+                rows = portal_db.rows(cur)
+                note_row = rows[0] if rows else {}
+                portal_db.log_action(
+                    cur,
+                    client_id,
+                    "customer.note_added",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Customer note added for " + contact_id + ".",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customer note add")[0]), 503
+    return jsonify({"ok": True, "note": _customer_note_public(note_row)}), 200
+
+
+@bp.delete("/customers/notes/<int:note_id>")
+def delete_customer_note(note_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM " + portal_db._q(portal_db.CUSTOMER_NOTES_TABLE) +
+                    " WHERE id = %s AND client_id = %s RETURNING id",
+                    (note_id, client_id),
+                )
+                deleted = portal_db.rows(cur)
+                if deleted:
+                    portal_db.log_action(
+                        cur,
+                        client_id,
+                        "customer.note_deleted",
+                        "customer_user",
+                        principal.get("user_id"),
+                        None,
+                        "Customer note deleted.",
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customer note delete")[0]), 503
+    if not deleted:
+        return jsonify({"error": {"code": "not_found",
+                                  "message": "Note not found."}}), 404
+    return jsonify({"ok": True}), 200
 
 
 
