@@ -26,6 +26,7 @@ from portal_auth import (
 )
 import portal_db
 import portal_kb
+import portal_conversations
 
 
 logger = logging.getLogger("omniflow.portal-growth")
@@ -694,8 +695,16 @@ def portal_overview():
                     " WHERE client_id = %s AND status = 'open') AS open_now,"
                     " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
                     " WHERE client_id = %s AND status = 'open'"
-                    " AND assigned_to IS NULL) AS unassigned_open",
-                    (client_id, client_id, client_id, client_id, client_id),
+                    " AND assigned_to IS NULL) AS unassigned_open,"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " oc WHERE oc.client_id = %s AND oc.status = 'open'"
+                    " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+                    " om WHERE om.conversation_id = oc.id"
+                    " GROUP BY om.conversation_id"
+                    " HAVING COALESCE(MAX(CASE WHEN om.direction = 'in' THEN om.id END), 0)"
+                    " > COALESCE(MAX(CASE WHEN om.direction = 'out' THEN om.id END), 0))"
+                    " ) AS needs_reply_open",
+                    (client_id, client_id, client_id, client_id, client_id, client_id),
                 )
                 stat_rows = portal_db.rows(cur)
                 stats = stat_rows[0] if stat_rows else {}
@@ -709,6 +718,10 @@ def portal_overview():
                     (client_id,),
                 )
                 lead_rows = portal_db.rows(cur)
+                try:
+                    portal_conversations.sweep_auto_close(client_id, conn)
+                except Exception:
+                    pass
             conn.commit()
         finally:
             conn.close()
@@ -733,6 +746,7 @@ def portal_overview():
             "team_replies": int(stats.get("team_replies") or 0),
             "open_now": int(stats.get("open_now") or 0),
             "unassigned_open": int(stats.get("unassigned_open") or 0),
+            "needs_reply_open": int(stats.get("needs_reply_open") or 0),
         },
         "hot_leads": hot_leads,
     }), 200

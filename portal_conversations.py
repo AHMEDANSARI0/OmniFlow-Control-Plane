@@ -73,6 +73,7 @@ def _conversation_public(row: Any) -> dict:
         "last_message_preview": row.get("last_message_preview"),
         "created_at": _iso(row.get("created_at")),
         "unread": bool(row.get("unread")),
+        "needs_reply": bool(row.get("needs_reply")),
         "last_intent": row.get("last_intent"),
         "lead_score": int(row.get("lead_score") or 0),
         "lead_temp": row.get("lead_temp") or "cold",
@@ -154,7 +155,13 @@ def list_conversations():
         " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
         " m WHERE m.conversation_id = c.id AND m.direction = 'in'"
         " AND m.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0))"
-        " ) AS unread FROM "
+        " ) AS unread, EXISTS ("
+        " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+        " lr WHERE lr.conversation_id = c.id"
+        " GROUP BY lr.conversation_id"
+        " HAVING COALESCE(MAX(CASE WHEN lr.direction = 'in' THEN lr.id END), 0)"
+        " > COALESCE(MAX(CASE WHEN lr.direction = 'out' THEN lr.id END), 0)"
+        " ) AS needs_reply FROM "
         + portal_db._q(portal_db.CONV_TABLE) + " c"
         " LEFT JOIN " + portal_db._q(portal_db.TEAM_TABLE) + " tm"
         " ON tm.client_id = c.client_id AND tm.email = c.assigned_to"
@@ -180,6 +187,15 @@ def list_conversations():
             " AND LOWER(ct.tag) = LOWER(%s))"
         )
         params.append(tag_filter)
+    needs_reply_filter = (request.args.get("needs_reply") or "").strip()
+    if needs_reply_filter == "1":
+        sql += (
+            " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " nr WHERE nr.conversation_id = c.id"
+            " GROUP BY nr.conversation_id"
+            " HAVING COALESCE(MAX(CASE WHEN nr.direction = 'in' THEN nr.id END), 0)"
+            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0))"
+        )
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
@@ -823,6 +839,14 @@ def export_conversations():
             " AND LOWER(ct.tag) = LOWER(%s))"
         )
         params.append(tag_filter)
+    if (request.args.get("needs_reply") or "").strip() == "1":
+        sql += (
+            " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " nr WHERE nr.conversation_id = c.id"
+            " GROUP BY nr.conversation_id"
+            " HAVING COALESCE(MAX(CASE WHEN nr.direction = 'in' THEN nr.id END), 0)"
+            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0))"
+        )
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
@@ -1409,6 +1433,141 @@ def maybe_send_welcome(client_id, conversation_id, contact_id, contact_name, con
             "Welcome message queued for a new conversation.",
         )
     return True
+
+
+@bp.get("/automations/autoclose")
+def get_autoclose_settings():
+    """Current auto-close settings (defaults when never configured)."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT close_enabled, close_after_hours FROM "
+                    + portal_db._q(WELCOME_SETTINGS_TABLE) +
+                    " WHERE client_id = %s LIMIT 1",
+                    (client_id,),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "autoclose settings read")[0]), 503
+    row = rows[0] if rows else {}
+    try:
+        hours = int(row.get("close_after_hours") or 48)
+    except (TypeError, ValueError):
+        hours = 48
+    return jsonify({
+        "ok": True,
+        "enabled": bool(row.get("close_enabled")),
+        "hours": hours,
+    }), 200
+
+
+@bp.put("/automations/autoclose")
+def save_autoclose_settings():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enabled must be true or false."}}), 400
+    hours = payload.get("hours", 48)
+    if isinstance(hours, bool) or not isinstance(hours, int)             or hours < 1 or hours > 720:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Hours must be a whole number between 1 and 720."}}), 400
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(WELCOME_SETTINGS_TABLE) +
+                    " (client_id, close_enabled, close_after_hours, updated_at)"
+                    " VALUES (%s, %s, %s, NOW())"
+                    " ON CONFLICT (client_id) DO UPDATE SET"
+                    " close_enabled = EXCLUDED.close_enabled,"
+                    " close_after_hours = EXCLUDED.close_after_hours,"
+                    " updated_at = NOW()",
+                    (client_id, enabled, hours),
+                )
+                portal_db.log_action(
+                    cur,
+                    client_id,
+                    "automation.autoclose_updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Auto-close enabled (idle over " + str(hours) + " hours)."
+                    if enabled else "Auto-close disabled.",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "autoclose settings save")[0]), 503
+    return jsonify({"ok": True, "enabled": enabled, "hours": hours}), 200
+
+
+def sweep_auto_close(client_id, conn):
+    """Close idle open chats when auto-close is enabled.
+
+    Deterministic: one settings read, at most one UPDATE. Returns the number
+    of conversations closed. The caller owns the transaction/commit and
+    wraps this in try/except.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT close_enabled, close_after_hours FROM "
+            + portal_db._q(WELCOME_SETTINGS_TABLE) +
+            " WHERE client_id = %s LIMIT 1",
+            (client_id,),
+        )
+        rows = portal_db.rows(cur)
+        if not rows or not rows[0].get("close_enabled"):
+            return 0
+        try:
+            hours = int(rows[0].get("close_after_hours") or 48)
+        except (TypeError, ValueError):
+            hours = 48
+        if hours < 1:
+            return 0
+        cur.execute(
+            "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+            " SET status = 'closed', updated_at = NOW()"
+            " WHERE client_id = %s AND status = 'open'"
+            " AND last_message_at < NOW() - make_interval(hours => %s)"
+            " RETURNING id",
+            (client_id, hours),
+        )
+        closed = portal_db.rows(cur)
+        if closed:
+            portal_db.log_action(
+                cur,
+                client_id,
+                "conversations.auto_closed",
+                "system",
+                None,
+                None,
+                "Auto-closed " + str(len(closed)) + " idle chat(s).",
+            )
+        return len(closed)
 
 
 
