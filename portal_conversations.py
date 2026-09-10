@@ -147,6 +147,9 @@ def list_conversations():
     search = (request.args.get("q") or "").strip()
     if len(search) > 100:
         search = search[:100]
+    sort_order = (request.args.get("sort") or "").strip().lower()
+    if sort_order not in ("", "oldest"):
+        sort_order = ""
 
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
@@ -212,7 +215,10 @@ def list_conversations():
             " sm WHERE sm.conversation_id = c.id AND sm.body ILIKE %s))"
         )
         params.extend([like, like, like])
-    sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
+    if sort_order == "oldest":
+        sql += " ORDER BY c.last_message_at ASC NULLS LAST, c.id ASC LIMIT %s"
+    else:
+        sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
     params.append(limit)
 
     tags_map = {}
@@ -817,6 +823,9 @@ def export_conversations():
         return jsonify({"error": {"code": "bad_request",
                                   "message": "status must be all, open, or closed."}}), 400
     search = (request.args.get("q") or "").strip()[:100]
+    sort_order = (request.args.get("sort") or "").strip().lower()
+    if sort_order not in ("", "oldest"):
+        sort_order = ""
     intent_filter = (request.args.get("intent") or "").strip().lower()
     channel_filter = (request.args.get("channel") or "").strip().lower()
     tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
@@ -872,7 +881,10 @@ def export_conversations():
             " sm WHERE sm.conversation_id = c.id AND sm.body ILIKE %s))"
         )
         params.extend([like, like, like])
-    sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
+    if sort_order == "oldest":
+        sql += " ORDER BY c.last_message_at ASC NULLS LAST, c.id ASC LIMIT %s"
+    else:
+        sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
     params.append(EXPORT_LIMIT)
 
     tags_map = {}
