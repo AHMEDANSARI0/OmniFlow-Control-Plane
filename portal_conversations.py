@@ -20,6 +20,7 @@ for both human sessions and portal API keys (ofk_ — read-only anyway).
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -188,14 +189,21 @@ def list_conversations():
         )
         params.append(tag_filter)
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
-    if needs_reply_filter == "1":
+    if needs_reply_filter in ("1", "overdue"):
         sql += (
             " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
             " nr WHERE nr.conversation_id = c.id"
             " GROUP BY nr.conversation_id"
             " HAVING COALESCE(MAX(CASE WHEN nr.direction = 'in' THEN nr.id END), 0)"
-            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0))"
+            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0)"
         )
+        if needs_reply_filter == "overdue":
+            sql += (
+                " AND MAX(CASE WHEN nr.direction = 'in' THEN nr.created_at END)"
+                " < NOW() - make_interval(hours => %s)"
+            )
+            params.append(OVERDUE_HOURS)
+        sql += ")"
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
@@ -839,14 +847,23 @@ def export_conversations():
             " AND LOWER(ct.tag) = LOWER(%s))"
         )
         params.append(tag_filter)
-    if (request.args.get("needs_reply") or "").strip() == "1":
+    needs_reply_filter = (request.args.get("needs_reply") or "").strip()
+    export_reply = needs_reply_filter
+    if export_reply in ("1", "overdue"):
         sql += (
             " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
             " nr WHERE nr.conversation_id = c.id"
             " GROUP BY nr.conversation_id"
             " HAVING COALESCE(MAX(CASE WHEN nr.direction = 'in' THEN nr.id END), 0)"
-            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0))"
+            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0)"
         )
+        if export_reply == "overdue":
+            sql += (
+                " AND MAX(CASE WHEN nr.direction = 'in' THEN nr.created_at END)"
+                " < NOW() - make_interval(hours => %s)"
+            )
+            params.append(OVERDUE_HOURS)
+        sql += ")"
     if search:
         like = "%" + search.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
         sql += (
@@ -1000,6 +1017,11 @@ MAX_KEYWORD_LENGTH = 40
 AUTOMATION_ACTION_TYPES = ("add_tag", "assign")
 AUTOMATIONS_TABLE = portal_db.AUTOMATIONS_TABLE
 WELCOME_SETTINGS_TABLE = portal_db.AUTOMATION_SETTINGS_TABLE
+
+try:
+    OVERDUE_HOURS = max(1, min(72, int(os.environ.get("OF_SLA_HOURS", "4"))))
+except ValueError:
+    OVERDUE_HOURS = 4
 
 
 def _normalize_keyword(value) -> str:

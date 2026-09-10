@@ -14,6 +14,7 @@ bridge changes, no bot restart.
 
 import json
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -42,6 +43,11 @@ BROADCAST_MAX_RECIPIENTS = 200
 GAP_COOLDOWN_SECONDS = 300
 GAP_QUESTION_MAX = 300
 CSAT_WINDOW_HOURS = 48
+
+try:
+    OVERDUE_HOURS = max(1, min(72, int(os.environ.get("OF_SLA_HOURS", "4"))))
+except ValueError:
+    OVERDUE_HOURS = 4
 
 AUDIENCES = ("all", "open", "hot")
 AUDIENCE_LABELS = {
@@ -703,8 +709,19 @@ def portal_overview():
                     " GROUP BY om.conversation_id"
                     " HAVING COALESCE(MAX(CASE WHEN om.direction = 'in' THEN om.id END), 0)"
                     " > COALESCE(MAX(CASE WHEN om.direction = 'out' THEN om.id END), 0))"
-                    " ) AS needs_reply_open",
-                    (client_id, client_id, client_id, client_id, client_id, client_id),
+                    " ) AS needs_reply_open,"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " od WHERE od.client_id = %s AND od.status = 'open'"
+                    " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+                    " om WHERE om.conversation_id = od.id"
+                    " GROUP BY om.conversation_id"
+                    " HAVING COALESCE(MAX(CASE WHEN om.direction = 'in' THEN om.id END), 0)"
+                    " > COALESCE(MAX(CASE WHEN om.direction = 'out' THEN om.id END), 0)"
+                    " AND MAX(CASE WHEN om.direction = 'in' THEN om.created_at END)"
+                    " < NOW() - make_interval(hours => %s))"
+                    " ) AS needs_reply_overdue",
+                    (client_id, client_id, client_id, client_id, client_id, client_id,
+                     client_id, OVERDUE_HOURS),
                 )
                 stat_rows = portal_db.rows(cur)
                 stats = stat_rows[0] if stat_rows else {}
@@ -747,6 +764,7 @@ def portal_overview():
             "open_now": int(stats.get("open_now") or 0),
             "unassigned_open": int(stats.get("unassigned_open") or 0),
             "needs_reply_open": int(stats.get("needs_reply_open") or 0),
+            "needs_reply_overdue": int(stats.get("needs_reply_overdue") or 0),
         },
         "hot_leads": hot_leads,
     }), 200
