@@ -41,6 +41,7 @@ bp = Blueprint("portal_conversations", __name__, url_prefix="/api/v1/portal")
 
 ALLOWED_STATUS = ("all", "open", "closed")
 MESSAGE_PAGE_SIZE = 200
+BULK_MAX_IDS = 50
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -252,7 +253,7 @@ def list_conversations():
         item["tags"] = tags_map.get(row.get("id"), [])
         conversations.append(item)
 
-    counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0}
+    counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0, "unread": 0}
     if include_counts:
         counts_sql = (
             "SELECT COUNT(*) FILTER (WHERE EXISTS ("
@@ -271,6 +272,11 @@ def list_conversations():
             " AND MAX(CASE WHEN od.direction = 'in' THEN od.created_at END)"
             " < NOW() - make_interval(hours => %s)"
             " )) AS overdue,"
+            " COUNT(*) FILTER (WHERE EXISTS ("
+            " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " nb WHERE nb.conversation_id = c.id"
+            " AND nb.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0))"
+            " )) AS unread,"
             " COUNT(*) FILTER (WHERE c.assigned_to IS NULL) AS unassigned"
             " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
             " WHERE c.client_id = %s AND c.status = 'open'"
@@ -287,11 +293,12 @@ def list_conversations():
                             "needs_reply": int(summary[0].get("needs_reply") or 0),
                             "overdue": int(summary[0].get("overdue") or 0),
                             "unassigned": int(summary[0].get("unassigned") or 0),
+                            "unread": int(summary[0].get("unread") or 0),
                         }
             finally:
                 conn.close()
         except Exception:
-            counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0}
+            counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0, "unread": 0}
 
     response_payload = {"conversations": conversations}
     if include_counts:
@@ -330,9 +337,12 @@ def conversation_detail(conversation_id: int):
                     "SELECT id, direction, body, status, intent, created_at FROM "
                     + portal_db._q(portal_db.MSGS_TABLE) +
                     " WHERE conversation_id = %s ORDER BY id DESC LIMIT %s",
-                    (conversation_id, MESSAGE_PAGE_SIZE),
+                    (conversation_id, MESSAGE_PAGE_SIZE + 1),
                 )
                 msgs = portal_db.rows(cur)
+                has_more = len(msgs) > MESSAGE_PAGE_SIZE
+                if has_more:
+                    msgs = msgs[:MESSAGE_PAGE_SIZE]
                 detail_tags = _tags_map(
                     cur, principal["client_id"], [conversation_id]
                 ).get(conversation_id, [])
@@ -353,6 +363,62 @@ def conversation_detail(conversation_id: int):
     return jsonify({
         "conversation": conversation_public,
         "messages": [_message_public(m) for m in reversed(msgs)],
+        "has_more": has_more,
+    }), 200
+
+
+@bp.get("/conversations/<int:conversation_id>/messages")
+def conversation_messages(conversation_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    raw_before = request.args.get("before_id") or ""
+    try:
+        before_id = int(raw_before) if raw_before else 0
+    except (TypeError, ValueError):
+        before_id = 0
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE id = %s AND client_id = %s LIMIT 1",
+                    (conversation_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Conversation not found."}}), 404
+                if before_id > 0:
+                    cur.execute(
+                        "SELECT id, direction, body, status, intent, created_at FROM "
+                        + portal_db._q(portal_db.MSGS_TABLE) +
+                        " WHERE conversation_id = %s AND id < %s"
+                        " ORDER BY id DESC LIMIT %s",
+                        (conversation_id, before_id, MESSAGE_PAGE_SIZE + 1),
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, direction, body, status, intent, created_at FROM "
+                        + portal_db._q(portal_db.MSGS_TABLE) +
+                        " WHERE conversation_id = %s"
+                        " ORDER BY id DESC LIMIT %s",
+                        (conversation_id, MESSAGE_PAGE_SIZE + 1),
+                    )
+                msgs = portal_db.rows(cur)
+                has_more = len(msgs) > MESSAGE_PAGE_SIZE
+                if has_more:
+                    msgs = msgs[:MESSAGE_PAGE_SIZE]
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "conversation messages")[0]), 503
+    return jsonify({
+        "messages": [_message_public(m) for m in reversed(msgs)],
+        "has_more": has_more,
     }), 200
 
 
@@ -431,6 +497,91 @@ def update_conversation(conversation_id: int):
         return jsonify({"error": {"code": "not_found",
                                   "message": "Conversation not found."}}), 404
     return jsonify({"conversation": _conversation_public(updated[0])}), 200
+
+
+@bp.post("/conversations/bulk")
+def bulk_update_conversations():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    payload = request.get_json(silent=True) or {}
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in ("close", "reopen", "assign", "unassign"):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "action must be close, reopen, assign, or unassign."}}), 400
+    raw_ids = payload.get("ids")
+    if not isinstance(raw_ids, list):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "ids must be a list."}}), 400
+    ids = []
+    for value in raw_ids[:BULK_MAX_IDS]:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0 and value not in ids:
+            ids.append(value)
+    if not ids:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "At least one conversation id is required."}}), 400
+
+    assignee = ""
+    if action == "assign":
+        assignee = str(payload.get("assignee_email") or "").strip().lower()[:120]
+        if not assignee:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "assignee_email is required for assign."}}), 400
+
+    status_value = {"close": "closed", "reopen": "open"}.get(action)
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                if action == "assign":
+                    cur.execute(
+                        "SELECT 1 FROM " + portal_db._q(portal_db.TEAM_TABLE) +
+                        " WHERE client_id = %s AND email = %s"
+                        " AND (status = 'active' OR status IS NULL) LIMIT 1",
+                        (principal["client_id"], assignee),
+                    )
+                    if not portal_db.rows(cur):
+                        return jsonify({"error": {"code": "assignee_not_found",
+                                                  "message": "That teammate is not an active member."}}), 404
+                if status_value:
+                    cur.execute(
+                        "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                        " SET status = %s, updated_at = NOW()"
+                        " WHERE client_id = %s AND id = ANY(%s) RETURNING id",
+                        (status_value, principal["client_id"], ids),
+                    )
+                elif action == "assign":
+                    cur.execute(
+                        "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                        " SET assigned_to = %s, updated_at = NOW()"
+                        " WHERE client_id = %s AND id = ANY(%s) RETURNING id",
+                        (assignee, principal["client_id"], ids),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                        " SET assigned_to = NULL, updated_at = NOW()"
+                        " WHERE client_id = %s AND id = ANY(%s) RETURNING id",
+                        (principal["client_id"], ids),
+                    )
+                updated = portal_db.rows(cur)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "conversation.bulk_" + action,
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Bulk " + action + " on " + str(len(updated)) + " conversations.",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "conversation bulk update")[0]), 503
+    return jsonify({"ok": True, "updated": len(updated)}), 200
 
 
 @bp.post("/conversations/<int:conversation_id>/messages")
