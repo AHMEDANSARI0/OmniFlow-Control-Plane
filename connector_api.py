@@ -539,7 +539,21 @@ def ingest_whatsapp_messages():
                             )
                         except Exception:
                             pass
+                        try:
+                            portal_conversations.auto_assign_new_chat(
+                                tenant["client_id"],
+                                conversation_id,
+                                conn,
+                            )
+                        except Exception:
+                            pass
                     inserted += 1
+            try:
+                portal_conversations.sweep_auto_close(
+                    tenant["client_id"], conn,
+                )
+            except Exception:
+                pass
             conn.commit()
         finally:
             conn.close()

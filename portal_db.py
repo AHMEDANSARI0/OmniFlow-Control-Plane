@@ -315,6 +315,12 @@ CREATE TABLE IF NOT EXISTS portal_automation_settings (
   welcome_text TEXT NOT NULL DEFAULT '',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+ALTER TABLE portal_automation_settings
+  ADD COLUMN IF NOT EXISTS close_enabled BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE portal_automation_settings
+  ADD COLUMN IF NOT EXISTS close_after_hours INT NOT NULL DEFAULT 48;
+ALTER TABLE portal_automation_settings
+  ADD COLUMN IF NOT EXISTS assign_enabled BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE TABLE IF NOT EXISTS portal_conversation_tags (
   id BIGSERIAL PRIMARY KEY,
   client_id BIGINT NOT NULL,

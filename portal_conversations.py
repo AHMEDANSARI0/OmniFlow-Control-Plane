@@ -1570,6 +1570,139 @@ def sweep_auto_close(client_id, conn):
         return len(closed)
 
 
+@bp.get("/automations/autoassign")
+def get_autoassign_settings():
+    """Current auto-assign setting (off until the merchant turns it on)."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT assign_enabled FROM "
+                    + portal_db._q(WELCOME_SETTINGS_TABLE) +
+                    " WHERE client_id = %s LIMIT 1",
+                    (client_id,),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "autoassign settings read")[0]), 503
+    row = rows[0] if rows else {}
+    return jsonify({
+        "ok": True,
+        "enabled": bool(row.get("assign_enabled")),
+    }), 200
+
+
+@bp.put("/automations/autoassign")
+def save_autoassign_settings():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enabled must be true or false."}}), 400
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(WELCOME_SETTINGS_TABLE) +
+                    " (client_id, assign_enabled, updated_at)"
+                    " VALUES (%s, %s, NOW())"
+                    " ON CONFLICT (client_id) DO UPDATE SET"
+                    " assign_enabled = EXCLUDED.assign_enabled,"
+                    " updated_at = NOW()",
+                    (client_id, enabled),
+                )
+                portal_db.log_action(
+                    cur,
+                    client_id,
+                    "automation.autoassign_updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Auto-assign enabled (least-loaded teammate)."
+                    if enabled else "Auto-assign disabled.",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "autoassign settings save")[0]), 503
+    return jsonify({"ok": True, "enabled": enabled}), 200
+
+
+def auto_assign_new_chat(client_id, conversation_id, conn):
+    """Assign a brand-new chat to the active teammate with fewest open chats.
+
+    Deterministic least-loaded pick: subquery counts each member's currently
+    open assigned conversations, ordered ascending, tie-break lowest team id.
+    Returns the assigned email, or None when disabled / no active members.
+    The caller owns the transaction and wraps this in try/except.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT assign_enabled FROM "
+            + portal_db._q(WELCOME_SETTINGS_TABLE) +
+            " WHERE client_id = %s LIMIT 1",
+            (client_id,),
+        )
+        rows = portal_db.rows(cur)
+        if not rows or not rows[0].get("assign_enabled"):
+            return None
+        cur.execute(
+            "SELECT tm.email, tm.name FROM "
+            + portal_db._q(portal_db.TEAM_TABLE) + " tm"
+            " WHERE tm.client_id = %s AND tm.status = 'active'"
+            " ORDER BY ("
+            " SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
+            " oc WHERE oc.client_id = tm.client_id"
+            " AND oc.assigned_to = tm.email AND oc.status = 'open'"
+            " ) ASC, tm.id ASC LIMIT 1",
+            (client_id,),
+        )
+        members = portal_db.rows(cur)
+        if not members:
+            return None
+        email = str(members[0].get("email") or "").strip()
+        if not email:
+            return None
+        cur.execute(
+            "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+            " SET assigned_to = %s, updated_at = NOW()"
+            " WHERE id = %s AND client_id = %s",
+            (email, conversation_id, client_id),
+        )
+        portal_db.log_action(
+            cur,
+            client_id,
+            "automation.auto_assigned",
+            "system",
+            None,
+            conversation_id,
+            "Auto-assigned to " + email + " (least loaded).",
+        )
+    return email
+
+
 
 
 
