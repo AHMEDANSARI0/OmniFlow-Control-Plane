@@ -150,6 +150,10 @@ def list_conversations():
     sort_order = (request.args.get("sort") or "").strip().lower()
     if sort_order not in ("", "oldest"):
         sort_order = ""
+    assigned_filter = (request.args.get("assigned") or "").strip().lower()
+    if assigned_filter not in ("", "unassigned", "me"):
+        assigned_filter = ""
+    include_counts = (request.args.get("include") or "").strip().lower() == "counts"
 
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
@@ -191,6 +195,12 @@ def list_conversations():
             " AND LOWER(ct.tag) = LOWER(%s))"
         )
         params.append(tag_filter)
+    if assigned_filter == "unassigned":
+        sql += " AND c.assigned_to IS NULL"
+    elif assigned_filter == "me":
+        sql += " AND c.assigned_to = %s"
+        params.append(principal["email"])
+
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     if needs_reply_filter in ("1", "overdue"):
         sql += (
@@ -241,7 +251,52 @@ def list_conversations():
         item = _conversation_public(row)
         item["tags"] = tags_map.get(row.get("id"), [])
         conversations.append(item)
-    return jsonify({"conversations": conversations}), 200
+
+    counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0}
+    if include_counts:
+        counts_sql = (
+            "SELECT COUNT(*) FILTER (WHERE EXISTS ("
+            " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " nr WHERE nr.conversation_id = c.id"
+            " GROUP BY nr.conversation_id"
+            " HAVING COALESCE(MAX(CASE WHEN nr.direction = 'in' THEN nr.id END), 0)"
+            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0)"
+            " )) AS needs_reply,"
+            " COUNT(*) FILTER (WHERE EXISTS ("
+            " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " od WHERE od.conversation_id = c.id"
+            " GROUP BY od.conversation_id"
+            " HAVING COALESCE(MAX(CASE WHEN od.direction = 'in' THEN od.id END), 0)"
+            " > COALESCE(MAX(CASE WHEN od.direction = 'out' THEN od.id END), 0)"
+            " AND MAX(CASE WHEN od.direction = 'in' THEN od.created_at END)"
+            " < NOW() - make_interval(hours => %s)"
+            " )) AS overdue,"
+            " COUNT(*) FILTER (WHERE c.assigned_to IS NULL) AS unassigned"
+            " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+            " WHERE c.client_id = %s AND c.status = 'open'"
+        )
+        try:
+            portal_db.ensure_tables()
+            conn = portal_db._conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(counts_sql, (OVERDUE_HOURS, principal["client_id"]))
+                    summary = portal_db.rows(cur)
+                    if summary:
+                        counts = {
+                            "needs_reply": int(summary[0].get("needs_reply") or 0),
+                            "overdue": int(summary[0].get("overdue") or 0),
+                            "unassigned": int(summary[0].get("unassigned") or 0),
+                        }
+            finally:
+                conn.close()
+        except Exception:
+            counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0}
+
+    response_payload = {"conversations": conversations}
+    if include_counts:
+        response_payload["counts"] = counts
+    return jsonify(response_payload), 200
 
 
 @bp.get("/conversations/<int:conversation_id>")
@@ -826,6 +881,9 @@ def export_conversations():
     sort_order = (request.args.get("sort") or "").strip().lower()
     if sort_order not in ("", "oldest"):
         sort_order = ""
+    assigned_filter = (request.args.get("assigned") or "").strip().lower()
+    if assigned_filter not in ("", "unassigned", "me"):
+        assigned_filter = ""
     intent_filter = (request.args.get("intent") or "").strip().lower()
     channel_filter = (request.args.get("channel") or "").strip().lower()
     tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
@@ -856,6 +914,12 @@ def export_conversations():
             " AND LOWER(ct.tag) = LOWER(%s))"
         )
         params.append(tag_filter)
+    if assigned_filter == "unassigned":
+        sql += " AND c.assigned_to IS NULL"
+    elif assigned_filter == "me":
+        sql += " AND c.assigned_to = %s"
+        params.append(principal["email"])
+
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     export_reply = needs_reply_filter
     if export_reply in ("1", "overdue"):
