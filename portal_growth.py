@@ -658,3 +658,81 @@ def handle_inbound(client_id, conversation_id, contact_id, contact_name,
             conversation_id,
             "CSAT score " + str(score) + "/5.",
         )
+
+
+@bp.get("/portal/overview")
+def portal_overview():
+    """Live command-center numbers for the portal homepage.
+
+    Deterministic only: 24-hour counters (new chats, inbound messages, team
+    replies queued through the command queue), the live open/unassigned
+    snapshot, and the top hot leads. No AI cost, no bridge involvement.
+    """
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s"
+                    " AND created_at >= NOW() - INTERVAL '24 hours') AS new_chats,"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+                    " WHERE client_id = %s AND direction = 'in'"
+                    " AND created_at >= NOW() - INTERVAL '24 hours')"
+                    " AS inbound_messages,"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CMD_TABLE) +
+                    " WHERE client_id = %s AND action = 'send_message'"
+                    " AND created_at >= NOW() - INTERVAL '24 hours')"
+                    " AS team_replies,"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND status = 'open') AS open_now,"
+                    " (SELECT COUNT(*) FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND status = 'open'"
+                    " AND assigned_to IS NULL) AS unassigned_open",
+                    (client_id, client_id, client_id, client_id, client_id),
+                )
+                stat_rows = portal_db.rows(cur)
+                stats = stat_rows[0] if stat_rows else {}
+                cur.execute(
+                    "SELECT id, contact_id, contact_name, lead_score,"
+                    " last_message_preview, last_message_at"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND status = 'open' AND hot = TRUE"
+                    " ORDER BY lead_score DESC NULLS LAST,"
+                    " last_message_at DESC NULLS LAST LIMIT 5",
+                    (client_id,),
+                )
+                lead_rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "portal overview")[0]), 503
+    hot_leads = []
+    for row in lead_rows:
+        preview = row.get("last_message_preview")
+        hot_leads.append({
+            "id": row.get("id"),
+            "contact_id": row.get("contact_id"),
+            "contact_name": row.get("contact_name"),
+            "lead_score": row.get("lead_score"),
+            "preview": preview[:120] if isinstance(preview, str) else None,
+            "last_message_at": _iso(row.get("last_message_at")),
+        })
+    return jsonify({
+        "ok": True,
+        "stats": {
+            "new_chats": int(stats.get("new_chats") or 0),
+            "inbound_messages": int(stats.get("inbound_messages") or 0),
+            "team_replies": int(stats.get("team_replies") or 0),
+            "open_now": int(stats.get("open_now") or 0),
+            "unassigned_open": int(stats.get("unassigned_open") or 0),
+        },
+        "hot_leads": hot_leads,
+    }), 200
