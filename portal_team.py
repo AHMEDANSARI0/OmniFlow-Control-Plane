@@ -622,15 +622,21 @@ def team_performance():
                 board_rows = portal_db.rows(cur)
                 board_row = board_rows[0] if board_rows else {}
                 cur.execute(
-                    "SELECT COUNT(*) AS answered, AVG(score) AS avg_score"
+                    "SELECT score, COUNT(*) AS total, MAX(answered_at) AS latest"
                     " FROM " + portal_db._q(portal_db.CSAT_TABLE) +
                     " WHERE client_id = %s AND score IS NOT NULL"
                     " AND answered_at >= NOW()"
-                    " - CAST(%s AS INT) * INTERVAL '1 day'",
+                    " - CAST(%s AS INT) * INTERVAL '1 day'"
+                    " GROUP BY score"
+                    " ORDER BY score ASC",
                     (client_id, PERF_WINDOW_DAYS),
                 )
                 csat_rows = portal_db.rows(cur)
-                csat_row = csat_rows[0] if csat_rows else {}
+                csat_total = sum(int(row.get("total") or 0) for row in csat_rows)
+                csat_weighted = sum(
+                    int(row.get("score") or 0) * int(row.get("total") or 0)
+                    for row in csat_rows
+                )
             conn.commit()
         finally:
             conn.close()
@@ -660,11 +666,22 @@ def team_performance():
             str(item.get("name") or item.get("email") or "").lower(),
         )
     )
-    avg_score = csat_row.get("avg_score")
-    try:
-        csat_avg = round(float(avg_score), 1) if avg_score is not None else None
-    except (TypeError, ValueError):
-        csat_avg = None
+    dist = [0, 0, 0, 0, 0]
+    recent = []
+    for row in csat_rows:
+        score = int(row.get("score") or 0)
+        total = int(row.get("total") or 0)
+        if 1 <= score <= 5:
+            dist[score - 1] = total
+        latest = _iso(row.get("latest"))
+        if latest:
+            recent.append({"score": score, "at": latest})
+    recent.sort(key=lambda item: item["at"], reverse=True)
+    recent = recent[:3]
+    csat_answered = sum(dist)
+    csat_avg = (
+        round(csat_weighted / csat_answered, 1) if csat_answered else None
+    )
     return jsonify({
         "ok": True,
         "window_days": PERF_WINDOW_DAYS,
@@ -674,6 +691,13 @@ def team_performance():
             "unassigned_open": int(board_row.get("unassigned_open") or 0),
             "replies_sent": total_replies,
             "csat_avg": csat_avg,
-            "csat_answered": int(csat_row.get("answered") or 0),
+            "csat_answered": csat_answered,
+            "csat_dist": dist,
+            "csat_low": [
+                {"score": score, "count": total}
+                for score, total in [(i + 1, dist[i]) for i in range(2)]
+                if total
+            ],
+            "csat_recent": recent,
         },
     }), 200
