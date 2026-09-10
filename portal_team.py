@@ -10,6 +10,7 @@ cost, no bridge changes, no bot restart.
 """
 
 import logging
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -520,3 +521,159 @@ def add_note(conversation_id: int):
     except Exception as error:
         return jsonify(portal_db.portal_unavailable(error, "conversation note add")[0]), 503
     return jsonify({"ok": True, "note": _note_public(note_row or {})}), 200
+
+
+# ---------------------------------------------------------------------------
+# Agent performance (last N days, deterministic SQL — zero AI)
+# ---------------------------------------------------------------------------
+
+try:
+    PERF_WINDOW_DAYS = max(
+        1, min(30, int(os.environ.get("OF_PERF_WINDOW_DAYS", "7") or 7))
+    )
+except ValueError:
+    PERF_WINDOW_DAYS = 7
+
+
+@bp.get("/portal/team/performance")
+def team_performance():
+    """Per-member activity for the last PERF_WINDOW_DAYS + live board counters.
+
+    Deterministic only: replies are queued send_message commands attributed
+    through platform_users.email, notes by author_email, plus the current
+    open-assignment snapshot. No bridge involvement, no AI cost.
+    """
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, email, name, role, status FROM "
+                    + portal_db._q(TEAM_TABLE) +
+                    " WHERE client_id = %s ORDER BY id ASC",
+                    (client_id,),
+                )
+                members = portal_db.rows(cur)
+                emails = []
+                for member in members:
+                    email = str(member.get("email") or "").strip().lower()
+                    if email and email not in emails:
+                        emails.append(email)
+                reply_by_email: Dict[str, int] = {}
+                touched_by_email: Dict[str, int] = {}
+                if emails:
+                    cur.execute(
+                        "SELECT LOWER(pu.email) AS email, COUNT(*) AS replies_sent,"
+                        " COUNT(DISTINCT cmd.payload->>'conversation_id')"
+                        " AS conversations_touched"
+                        " FROM " + portal_db._q(portal_db.CMD_TABLE) + " cmd"
+                        " JOIN " + portal_db._q(portal_db.USERS_TABLE) + " pu"
+                        " ON pu.id = cmd.requested_by"
+                        " WHERE cmd.client_id = %s AND cmd.action = 'send_message'"
+                        " AND cmd.created_at >= NOW()"
+                        " - CAST(%s AS INT) * INTERVAL '1 day'"
+                        " AND LOWER(pu.email) = ANY(%s)"
+                        " GROUP BY LOWER(pu.email)",
+                        (client_id, PERF_WINDOW_DAYS, emails),
+                    )
+                    for row in portal_db.rows(cur):
+                        email = str(row.get("email") or "").strip().lower()
+                        reply_by_email[email] = int(row.get("replies_sent") or 0)
+                        touched_by_email[email] = int(
+                            row.get("conversations_touched") or 0
+                        )
+                notes_by_email: Dict[str, int] = {}
+                cur.execute(
+                    "SELECT LOWER(author_email) AS email, COUNT(*) AS notes_added"
+                    " FROM " + portal_db._q(NOTES_TABLE) +
+                    " WHERE client_id = %s"
+                    " AND created_at >= NOW() - CAST(%s AS INT) * INTERVAL '1 day'"
+                    " GROUP BY LOWER(author_email)",
+                    (client_id, PERF_WINDOW_DAYS),
+                )
+                for row in portal_db.rows(cur):
+                    email = str(row.get("email") or "").strip().lower()
+                    notes_by_email[email] = int(row.get("notes_added") or 0)
+                assigned_by_email: Dict[str, int] = {}
+                cur.execute(
+                    "SELECT LOWER(assigned_to) AS email, COUNT(*) AS open_count"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND status = 'open'"
+                    " AND assigned_to IS NOT NULL"
+                    " GROUP BY LOWER(assigned_to)",
+                    (client_id,),
+                )
+                for row in portal_db.rows(cur):
+                    email = str(row.get("email") or "").strip().lower()
+                    assigned_by_email[email] = int(row.get("open_count") or 0)
+                cur.execute(
+                    "SELECT COUNT(*) FILTER (WHERE status = 'open') AS open_total,"
+                    " COUNT(*) FILTER (WHERE status = 'open'"
+                    " AND assigned_to IS NULL) AS unassigned_open"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s",
+                    (client_id,),
+                )
+                board_rows = portal_db.rows(cur)
+                board_row = board_rows[0] if board_rows else {}
+                cur.execute(
+                    "SELECT COUNT(*) AS answered, AVG(score) AS avg_score"
+                    " FROM " + portal_db._q(portal_db.CSAT_TABLE) +
+                    " WHERE client_id = %s AND score IS NOT NULL"
+                    " AND answered_at >= NOW()"
+                    " - CAST(%s AS INT) * INTERVAL '1 day'",
+                    (client_id, PERF_WINDOW_DAYS),
+                )
+                csat_rows = portal_db.rows(cur)
+                csat_row = csat_rows[0] if csat_rows else {}
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "team performance")[0]), 503
+    performance = []
+    total_replies = 0
+    for member in members:
+        email = str(member.get("email") or "").strip().lower()
+        replies_sent = reply_by_email.get(email, 0)
+        total_replies += replies_sent
+        role = member.get("role")
+        performance.append({
+            "id": member.get("id"),
+            "email": member.get("email"),
+            "name": member.get("name"),
+            "role": role if role in ("owner", "admin", "agent") else "agent",
+            "status": "disabled" if member.get("status") == "disabled" else "active",
+            "replies_sent": replies_sent,
+            "conversations_touched": touched_by_email.get(email, 0),
+            "notes_added": notes_by_email.get(email, 0),
+            "assigned_open": assigned_by_email.get(email, 0),
+        })
+    performance.sort(
+        key=lambda item: (
+            -item["replies_sent"],
+            str(item.get("name") or item.get("email") or "").lower(),
+        )
+    )
+    avg_score = csat_row.get("avg_score")
+    try:
+        csat_avg = round(float(avg_score), 1) if avg_score is not None else None
+    except (TypeError, ValueError):
+        csat_avg = None
+    return jsonify({
+        "ok": True,
+        "window_days": PERF_WINDOW_DAYS,
+        "members": performance,
+        "board": {
+            "open_conversations": int(board_row.get("open_total") or 0),
+            "unassigned_open": int(board_row.get("unassigned_open") or 0),
+            "replies_sent": total_replies,
+            "csat_avg": csat_avg,
+            "csat_answered": int(csat_row.get("answered") or 0),
+        },
+    }), 200
