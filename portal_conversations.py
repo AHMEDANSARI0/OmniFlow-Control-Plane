@@ -975,6 +975,7 @@ MAX_AUTOMATIONS = 20
 MAX_KEYWORD_LENGTH = 40
 AUTOMATION_ACTION_TYPES = ("add_tag", "assign")
 AUTOMATIONS_TABLE = portal_db.AUTOMATIONS_TABLE
+WELCOME_SETTINGS_TABLE = portal_db.AUTOMATION_SETTINGS_TABLE
 
 
 def _normalize_keyword(value) -> str:
@@ -1267,6 +1268,147 @@ def delete_automation(rule_id: int):
     except Exception as error:
         return jsonify(portal_db.portal_unavailable(error, "automation delete")[0]), 503
     return jsonify({"ok": True}), 200
+
+
+@bp.get("/automations/welcome")
+def get_welcome_settings():
+    """Current welcome-automation settings (defaults when never configured)."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT welcome_enabled, welcome_text FROM "
+                    + portal_db._q(WELCOME_SETTINGS_TABLE) +
+                    " WHERE client_id = %s LIMIT 1",
+                    (client_id,),
+                )
+                rows = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "welcome settings read")[0]), 503
+    row = rows[0] if rows else {}
+    return jsonify({
+        "ok": True,
+        "enabled": bool(row.get("welcome_enabled")),
+        "text": str(row.get("welcome_text") or ""),
+    }), 200
+
+
+@bp.put("/automations/welcome")
+def save_welcome_settings():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    enabled = payload.get("enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enabled must be true or false."}}), 400
+    text = payload.get("text")
+    text = text.strip() if isinstance(text, str) else ""
+    if enabled and not text:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Write the welcome message first."}}), 400
+    if len(text) > 500:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Welcome message must be 500 characters or fewer."}}), 400
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(WELCOME_SETTINGS_TABLE) +
+                    " (client_id, welcome_enabled, welcome_text, updated_at)"
+                    " VALUES (%s, %s, %s, NOW())"
+                    " ON CONFLICT (client_id) DO UPDATE SET"
+                    " welcome_enabled = EXCLUDED.welcome_enabled,"
+                    " welcome_text = EXCLUDED.welcome_text,"
+                    " updated_at = NOW()",
+                    (client_id, enabled, text),
+                )
+                portal_db.log_action(
+                    cur,
+                    client_id,
+                    "automation.welcome_updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Welcome automation " + ("enabled." if enabled else "disabled."),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "welcome settings save")[0]), 503
+    return jsonify({"ok": True, "enabled": enabled, "text": text}), 200
+
+
+def maybe_send_welcome(client_id, conversation_id, contact_id, contact_name, conn):
+    """Queue the welcome message for a brand-new WhatsApp conversation.
+
+    Called from the ingest path only when the conversation row was created by
+    the current message (the upsert's (xmax = 0) flag). Deterministic: one
+    settings read, at most one queued send_message command. Returns True when
+    a welcome was queued. The caller wraps this in try/except.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT welcome_enabled, welcome_text FROM "
+            + portal_db._q(WELCOME_SETTINGS_TABLE) +
+            " WHERE client_id = %s LIMIT 1",
+            (client_id,),
+        )
+        rows = portal_db.rows(cur)
+        if not rows or not rows[0].get("welcome_enabled"):
+            return False
+        text = str(rows[0].get("welcome_text") or "").strip()
+        if not text:
+            return False
+        display = str(contact_name or "").strip()
+        first_name = display.split(" ")[0] if display else ""
+        greeting = text.replace("{{name}}", first_name or "there")
+        greeting_payload = {
+            "external_user_id": contact_id,
+            "body": greeting[:1000],
+            "source": "welcome",
+        }
+        if display:
+            greeting_payload["target_display_name"] = display
+        cur.execute(
+            "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
+            " (client_id, channel, action, payload, status, requested_by,"
+            " created_at, updated_at) "
+            "VALUES (%s, 'whatsapp', 'send_message', CAST(%s AS JSONB),"
+            " 'pending', NULL, NOW(), NOW()) "
+            "RETURNING id",
+            (client_id, json.dumps(greeting_payload)),
+        )
+        portal_db.log_action(
+            cur,
+            client_id,
+            "automation.welcome_sent",
+            "system",
+            None,
+            conversation_id,
+            "Welcome message queued for a new conversation.",
+        )
+    return True
 
 
 

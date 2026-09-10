@@ -443,7 +443,7 @@ def ingest_whatsapp_messages():
                         " last_intent = COALESCE(EXCLUDED.last_intent, "
                         " " + portal_db._q(portal_db.CONV_TABLE) + ".last_intent), "
                         " updated_at = NOW() "
-                        "RETURNING id",
+                        "RETURNING id, (xmax = 0) AS is_new",
                         (tenant["client_id"], item["from"], item["name"], item["body"],
                          item["intent"]),
                     )
@@ -528,6 +528,17 @@ def ingest_whatsapp_messages():
                         )
                     except Exception:
                         pass
+                    if conv and conv[0].get("is_new") and item.get("direction") == "in":
+                        try:
+                            portal_conversations.maybe_send_welcome(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["name"],
+                                conn,
+                            )
+                        except Exception:
+                            pass
                     inserted += 1
             conn.commit()
         finally:

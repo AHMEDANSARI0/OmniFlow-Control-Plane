@@ -39,6 +39,9 @@ WIDGET_TABLE = os.environ.get("OF_WIDGET_TABLE", "portal_widget_settings")
 CONV_TAGS_TABLE = os.environ.get("OF_CONVTAGS_TABLE", "portal_conversation_tags")
 SAVED_REPLIES_TABLE = os.environ.get("OF_SAVEDREPLIES_TABLE", "portal_saved_replies")
 AUTOMATIONS_TABLE = os.environ.get("OF_AUTOMATIONS_TABLE", "portal_automations")
+AUTOMATION_SETTINGS_TABLE = os.environ.get(
+    "OF_AUTOMSETTINGS_TABLE", "portal_automation_settings"
+)
 USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
 USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 
@@ -302,6 +305,13 @@ CREATE TABLE IF NOT EXISTS portal_widget_settings (
   client_id BIGINT,
   enabled BOOLEAN NOT NULL DEFAULT TRUE,
   business_name TEXT NOT NULL DEFAULT '',
+  welcome_text TEXT NOT NULL DEFAULT '',
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS portal_automation_settings (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL UNIQUE,
+  welcome_enabled BOOLEAN NOT NULL DEFAULT FALSE,
   welcome_text TEXT NOT NULL DEFAULT '',
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
