@@ -1093,6 +1093,41 @@ def delete_saved_reply(reply_id: int):
 EXPORT_LIMIT = 500
 
 
+@bp.post("/conversations/read-all")
+def mark_all_conversations_read():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                    " SET last_read_at = NOW()"
+                    " WHERE client_id = %s AND status = 'open' RETURNING id",
+                    (principal["client_id"],),
+                )
+                updated = portal_db.rows(cur)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "conversation.read_all",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Marked " + str(len(updated)) + " conversations read.",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "conversation read-all")[0]), 503
+    return jsonify({"ok": True, "updated": len(updated)}), 200
+
+
 @bp.get("/conversations/export")
 def export_conversations():
     principal, error = _principal_or_error()
@@ -1118,6 +1153,14 @@ def export_conversations():
     starred_filter = (request.args.get("starred") or "").strip()
     if starred_filter != "1":
         starred_filter = ""
+    raw_id_parts = (request.args.get("ids") or "").split(",")
+    export_ids = []
+    for part in raw_id_parts[:100]:
+        part = part.strip()
+        if part.isdigit():
+            value = int(part)
+            if value > 0 and value not in export_ids:
+                export_ids.append(value)
     intent_filter = (request.args.get("intent") or "").strip().lower()
     channel_filter = (request.args.get("channel") or "").strip().lower()
     tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
@@ -1165,6 +1208,9 @@ def export_conversations():
         )
     if starred_filter == "1":
         sql += " AND c.starred = TRUE"
+    if export_ids:
+        sql += " AND c.id = ANY(%s)"
+        params.append(export_ids)
 
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     export_reply = needs_reply_filter
