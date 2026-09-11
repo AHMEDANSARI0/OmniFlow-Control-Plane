@@ -154,6 +154,12 @@ def list_conversations():
     assigned_filter = (request.args.get("assigned") or "").strip().lower()
     if assigned_filter not in ("", "unassigned", "me"):
         assigned_filter = ""
+    days_filter = (request.args.get("days") or "").strip()
+    if days_filter not in ("", "1", "7", "30"):
+        days_filter = ""
+    unread_filter = (request.args.get("unread") or "").strip()
+    if unread_filter != "1":
+        unread_filter = ""
     include_counts = (request.args.get("include") or "").strip().lower() == "counts"
 
     sql = (
@@ -201,6 +207,16 @@ def list_conversations():
     elif assigned_filter == "me":
         sql += " AND c.assigned_to = %s"
         params.append(principal["email"])
+
+    if days_filter:
+        sql += " AND c.last_message_at >= NOW() - make_interval(days => %s)"
+        params.append(int(days_filter))
+    if unread_filter == "1":
+        sql += (
+            " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " nb WHERE nb.conversation_id = c.id"
+            " AND nb.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0)))"
+        )
 
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     if needs_reply_filter in ("1", "overdue"):
@@ -1035,6 +1051,12 @@ def export_conversations():
     assigned_filter = (request.args.get("assigned") or "").strip().lower()
     if assigned_filter not in ("", "unassigned", "me"):
         assigned_filter = ""
+    days_filter = (request.args.get("days") or "").strip()
+    if days_filter not in ("", "1", "7", "30"):
+        days_filter = ""
+    unread_filter = (request.args.get("unread") or "").strip()
+    if unread_filter != "1":
+        unread_filter = ""
     intent_filter = (request.args.get("intent") or "").strip().lower()
     channel_filter = (request.args.get("channel") or "").strip().lower()
     tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
@@ -1070,6 +1092,16 @@ def export_conversations():
     elif assigned_filter == "me":
         sql += " AND c.assigned_to = %s"
         params.append(principal["email"])
+
+    if days_filter:
+        sql += " AND c.last_message_at >= NOW() - make_interval(days => %s)"
+        params.append(int(days_filter))
+    if unread_filter == "1":
+        sql += (
+            " AND EXISTS (SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+            " nb WHERE nb.conversation_id = c.id"
+            " AND nb.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0)))"
+        )
 
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     export_reply = needs_reply_filter
