@@ -81,6 +81,7 @@ def _conversation_public(row: Any) -> dict:
         "lead_temp": row.get("lead_temp") or "cold",
         "assigned_to": row.get("assigned_to"),
         "assignee_name": row.get("assignee_name"),
+        "starred": bool(row.get("starred")),
     }
 
 
@@ -144,6 +145,12 @@ def list_conversations():
     except (TypeError, ValueError):
         limit = 50
     limit = max(1, min(50, limit))
+    raw_page = request.args.get("page") or ""
+    try:
+        page = int(raw_page) if raw_page else 1
+    except (TypeError, ValueError):
+        page = 1
+    page = max(1, page)
 
     search = (request.args.get("q") or "").strip()
     if len(search) > 100:
@@ -161,11 +168,14 @@ def list_conversations():
     if unread_filter != "1":
         unread_filter = ""
     include_counts = (request.args.get("include") or "").strip().lower() == "counts"
+    starred_filter = (request.args.get("starred") or "").strip()
+    if starred_filter != "1":
+        starred_filter = ""
 
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
         " c.last_message_at, c.last_message_preview, c.created_at, c.last_intent,"
-        " c.lead_score, c.lead_temp, c.assigned_to, tm.name AS assignee_name,"
+        " c.lead_score, c.lead_temp, c.assigned_to, c.starred, tm.name AS assignee_name,"
         " EXISTS ("
         " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
         " m WHERE m.conversation_id = c.id AND m.direction = 'in'"
@@ -217,6 +227,8 @@ def list_conversations():
             " nb WHERE nb.conversation_id = c.id"
             " AND nb.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0)))"
         )
+    if starred_filter == "1":
+        sql += " AND c.starred = TRUE"
 
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     if needs_reply_filter in ("1", "overdue"):
@@ -243,15 +255,19 @@ def list_conversations():
         )
         params.extend([like, like, like])
     if sort_order == "oldest":
-        sql += " ORDER BY c.last_message_at ASC NULLS LAST, c.id ASC LIMIT %s"
+        sql += " ORDER BY c.starred DESC, c.last_message_at ASC NULLS LAST, c.id ASC LIMIT %s"
     else:
-        sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
+        sql += " ORDER BY c.starred DESC, c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
     params.append(limit)
+    if page > 1:
+        sql += " OFFSET %s"
+        params.append((page - 1) * limit)
 
     tags_map = {}
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
+        _ensure_star_column(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
@@ -331,12 +347,13 @@ def conversation_detail(conversation_id: int):
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
+        _ensure_star_column(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, channel, contact_id, contact_name, status,"
                     " last_message_at, last_message_preview, created_at,"
-                    " c.lead_score, c.lead_temp, c.assigned_to,"
+                    " c.lead_score, c.lead_temp, c.assigned_to, c.starred,"
                     " tm.name AS assignee_name FROM "
                     + portal_db._q(portal_db.CONV_TABLE) + " c"
                     " LEFT JOIN " + portal_db._q(portal_db.TEAM_TABLE) + " tm"
@@ -513,6 +530,47 @@ def update_conversation(conversation_id: int):
         return jsonify({"error": {"code": "not_found",
                                   "message": "Conversation not found."}}), 404
     return jsonify({"conversation": _conversation_public(updated[0])}), 200
+
+
+@bp.post("/conversations/<int:conversation_id>/star")
+def toggle_conversation_star(conversation_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        _ensure_star_column(conn)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                    " SET starred = NOT COALESCE(starred, FALSE)"
+                    " WHERE id = %s AND client_id = %s"
+                    " RETURNING starred",
+                    (conversation_id, principal["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+                if updated:
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "conversation.star_toggled",
+                        "customer_user",
+                        principal.get("user_id"),
+                        conversation_id,
+                        "Star " + ("on" if updated[0].get("starred") else "off") + ".",
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "conversation star")[0]), 503
+    if not updated:
+        return jsonify({"error": {"code": "not_found",
+                                  "message": "Conversation not found."}}), 404
+    return jsonify({"ok": True, "starred": bool(updated[0].get("starred"))}), 200
 
 
 @bp.post("/conversations/bulk")
@@ -1057,6 +1115,9 @@ def export_conversations():
     unread_filter = (request.args.get("unread") or "").strip()
     if unread_filter != "1":
         unread_filter = ""
+    starred_filter = (request.args.get("starred") or "").strip()
+    if starred_filter != "1":
+        starred_filter = ""
     intent_filter = (request.args.get("intent") or "").strip().lower()
     channel_filter = (request.args.get("channel") or "").strip().lower()
     tag_filter = (request.args.get("tag") or "").strip()[:MAX_TAG_LENGTH]
@@ -1064,7 +1125,7 @@ def export_conversations():
     sql = (
         "SELECT c.id, c.channel, c.contact_id, c.contact_name, c.status,"
         " c.last_message_at, c.last_message_preview, c.created_at, c.last_intent,"
-        " c.lead_score, c.lead_temp, c.assigned_to, tm.name AS assignee_name"
+        " c.lead_score, c.lead_temp, c.assigned_to, c.starred, tm.name AS assignee_name"
         " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
         " LEFT JOIN " + portal_db._q(portal_db.TEAM_TABLE) + " tm"
         " ON tm.client_id = c.client_id AND tm.email = c.assigned_to"
@@ -1102,6 +1163,8 @@ def export_conversations():
             " nb WHERE nb.conversation_id = c.id"
             " AND nb.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0)))"
         )
+    if starred_filter == "1":
+        sql += " AND c.starred = TRUE"
 
     needs_reply_filter = (request.args.get("needs_reply") or "").strip()
     export_reply = needs_reply_filter
@@ -1129,15 +1192,16 @@ def export_conversations():
         )
         params.extend([like, like, like])
     if sort_order == "oldest":
-        sql += " ORDER BY c.last_message_at ASC NULLS LAST, c.id ASC LIMIT %s"
+        sql += " ORDER BY c.starred DESC, c.last_message_at ASC NULLS LAST, c.id ASC LIMIT %s"
     else:
-        sql += " ORDER BY c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
+        sql += " ORDER BY c.starred DESC, c.last_message_at DESC NULLS LAST, c.id DESC LIMIT %s"
     params.append(EXPORT_LIMIT)
 
     tags_map = {}
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
+        _ensure_star_column(conn)
         try:
             with conn.cursor() as cur:
                 cur.execute(sql, tuple(params))
@@ -1279,8 +1343,24 @@ WELCOME_SETTINGS_TABLE = portal_db.AUTOMATION_SETTINGS_TABLE
 
 try:
     OVERDUE_HOURS = max(1, min(72, int(os.environ.get("OF_SLA_HOURS", "4"))))
-except ValueError:
+except (TypeError, ValueError):
     OVERDUE_HOURS = 4
+
+_STAR_COLUMN_READY = False
+
+
+def _ensure_star_column(conn) -> None:
+    """Lazy migration: older databases miss the starred flag (runs once)."""
+    global _STAR_COLUMN_READY
+    if _STAR_COLUMN_READY:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(portal_db.CONV_TABLE) +
+            " ADD COLUMN IF NOT EXISTS starred BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+    conn.commit()
+    _STAR_COLUMN_READY = True
 
 
 def _normalize_keyword(value) -> str:
