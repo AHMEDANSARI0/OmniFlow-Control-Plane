@@ -198,6 +198,12 @@ def list_commands():
         conn = portal_db._conn()
         try:
             with conn.cursor() as cur:
+                try:
+                    import portal_growth
+
+                    portal_growth.materialize_due_broadcasts(cur, tenant["client_id"], conn)
+                except Exception:
+                    pass
                 cur.execute(
                     "SELECT id, action, payload, created_at FROM "
                     + portal_db._q(portal_db.CMD_TABLE) +

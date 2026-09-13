@@ -40,6 +40,8 @@ CSAT_TABLE = portal_db.CSAT_TABLE
 
 BROADCAST_MAX_BODY = 1000
 BROADCAST_MAX_RECIPIENTS = 200
+BROADCAST_SCHEDULE_MAX_DAYS = 30
+_SCHEDULE_COLUMNS_READY = False
 GAP_COOLDOWN_SECONDS = 300
 GAP_QUESTION_MAX = 300
 CSAT_WINDOW_HOURS = 48
@@ -227,6 +229,243 @@ def list_broadcasts():
             public["failed"] = bucket["failed"]
         items.append(public)
     return jsonify({"broadcasts": items}), 200
+
+
+def _ensure_schedule_columns(conn) -> None:
+    """Lazy migration: schedules live on the broadcasts table (runs once)."""
+    global _SCHEDULE_COLUMNS_READY
+    if _SCHEDULE_COLUMNS_READY:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(BROADCASTS_TABLE) +
+            " ADD COLUMN IF NOT EXISTS send_at TIMESTAMPTZ,"
+            " ADD COLUMN IF NOT EXISTS recipients_json JSONB,"
+            " ADD COLUMN IF NOT EXISTS materialized_at TIMESTAMPTZ"
+        )
+    conn.commit()
+    _SCHEDULE_COLUMNS_READY = True
+
+
+def _parse_send_at(raw: Any):
+    """Accept an ISO timestamp; return an aware datetime or None."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed
+
+
+def _schedule_public(row: dict) -> dict:
+    send_at = row.get("send_at")
+    return {
+        "id": row.get("id"),
+        "audience": row.get("audience") or "all",
+        "body": row.get("body") or "",
+        "recipient_count": int(row.get("recipient_count") or 0),
+        "send_at": _iso(send_at),
+        "created_at": _iso(row.get("created_at")),
+    }
+
+
+@bp.post("/portal/broadcasts/schedule")
+def schedule_broadcast():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    client_id = principal["client_id"]
+    payload = request.get_json(silent=True) or {}
+    audience = str(payload.get("audience") or "all").strip().lower()
+    body = str(payload.get("body") or "").strip()
+    if audience not in AUDIENCES:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "audience must be all, open, or hot."}}), 400
+    if not body:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message text is required."}}), 400
+    if len(body) > BROADCAST_MAX_BODY:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Broadcasts must be 1000 characters or fewer."}}), 400
+    send_at = _parse_send_at(payload.get("send_at"))
+    if send_at is None:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "send_at must be an ISO date-time with a timezone."}}), 400
+    now_utc = datetime.now(timezone.utc)
+    if send_at <= now_utc:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Pick a time in the future."}}), 400
+    if send_at > now_utc + timedelta(days=BROADCAST_SCHEDULE_MAX_DAYS):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Schedule at most "
+                                  + str(BROADCAST_SCHEDULE_MAX_DAYS) + " days ahead."}}), 400
+    scheduled_row = None
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_schedule_columns(conn)
+            with conn.cursor() as cur:
+                recipients = _resolve_recipients(cur, client_id, audience)
+                if not recipients:
+                    return jsonify({"error": {"code": "no_recipients",
+                                              "message": "No conversations match this audience yet."}}), 400
+                if len(recipients) > BROADCAST_MAX_RECIPIENTS:
+                    return jsonify({"error": {"code": "too_many_recipients",
+                                              "message": "Audience has more than "
+                                              + str(BROADCAST_MAX_RECIPIENTS)
+                                              + " customers. Narrow it down (open chats or hot leads)."}}), 400
+                from psycopg2.extras import Json
+
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(BROADCASTS_TABLE) +
+                    " (client_id, audience, body, recipient_count, send_at, recipients_json)"
+                    " VALUES (%s, %s, %s, %s, %s, %s)"
+                    " RETURNING id, audience, body, recipient_count, send_at, created_at",
+                    (client_id, audience, body, len(recipients), send_at,
+                     Json([{"contact_id": str(r.get("contact_id") or ""),
+                            "contact_name": str(r.get("contact_name") or "")}
+                           for r in recipients])),
+                )
+                rows = portal_db.rows(cur)
+                scheduled_row = rows[0] if rows else {}
+                portal_db.log_action(
+                    cur,
+                    client_id,
+                    "broadcast.scheduled",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Broadcast scheduled for "
+                    + send_at.isoformat() + " ("
+                    + AUDIENCE_LABELS[audience] + ").",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "broadcast schedule")[0]), 503
+    return jsonify({"ok": True, "scheduled": _schedule_public(scheduled_row or {})}), 200
+
+
+@bp.get("/portal/broadcasts/scheduled")
+def list_scheduled_broadcasts():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_schedule_columns(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, audience, body, recipient_count, send_at, created_at"
+                    " FROM " + portal_db._q(BROADCASTS_TABLE) +
+                    " WHERE client_id = %s"
+                    " AND send_at IS NOT NULL AND materialized_at IS NULL"
+                    " ORDER BY send_at ASC LIMIT 20",
+                    (principal["client_id"],),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "scheduled broadcasts read")[0]), 503
+    return jsonify({"scheduled": [_schedule_public(row) for row in found]}), 200
+
+
+@bp.delete("/portal/broadcasts/scheduled/<int:broadcast_id>")
+def cancel_scheduled_broadcast(broadcast_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_schedule_columns(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM " + portal_db._q(BROADCASTS_TABLE) +
+                    " WHERE id = %s AND client_id = %s"
+                    " AND send_at IS NOT NULL AND materialized_at IS NULL"
+                    " RETURNING id",
+                    (broadcast_id, principal["client_id"]),
+                )
+                found = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "scheduled broadcast cancel")[0]), 503
+    if not found:
+        return jsonify({"error": {"code": "not_found",
+                                  "message": "Scheduled broadcast not found (or already sent)."}}), 404
+    return jsonify({"ok": True}), 200
+
+
+def materialize_due_broadcasts(cur, client_id, conn) -> int:
+    """Fan out due scheduled broadcasts as send_message commands (max 5)."""
+    cur.execute(
+        "SELECT id, client_id, audience, body, recipients_json"
+        " FROM " + portal_db._q(BROADCASTS_TABLE) +
+        " WHERE client_id = %s"
+        " AND send_at IS NOT NULL AND materialized_at IS NULL"
+        " AND send_at <= NOW()"
+        " ORDER BY send_at ASC LIMIT 5",
+        (client_id,),
+    )
+    due_rows = portal_db.rows(cur)
+    delivered = 0
+    for row in due_rows:
+        broadcast_id = int(row.get("id") or 0)
+        row_client = int(row.get("client_id") or client_id)
+        audience = str(row.get("audience") or "all")
+        body = str(row.get("body") or "")
+        recipients = row.get("recipients_json")
+        if not isinstance(recipients, list) or not recipients:
+            recipients = _resolve_recipients(cur, row_client, audience)
+        sent_count = 0
+        for recipient in recipients:
+            if not isinstance(recipient, dict):
+                continue
+            external_user_id = str(recipient.get("contact_id") or "").strip()
+            if not external_user_id:
+                continue
+            display = str(recipient.get("contact_name") or "").strip()
+            rendered = body.replace("{name}", _first_name(display))
+            _send_command(cur, row_client, external_user_id, display,
+                          rendered, "broadcast", broadcast_id=broadcast_id)
+            sent_count += 1
+        cur.execute(
+            "UPDATE " + portal_db._q(BROADCASTS_TABLE) +
+            " SET materialized_at = NOW() WHERE id = %s",
+            (broadcast_id,),
+        )
+        portal_db.log_action(
+            cur,
+            row_client,
+            "broadcast.sent",
+            "system",
+            None,
+            None,
+            "Scheduled broadcast delivered to "
+            + str(sent_count) + " customers (" + AUDIENCE_LABELS.get(audience, audience) + ").",
+        )
+        delivered += 1
+    if delivered:
+        conn.commit()
+    return delivered
 
 
 @bp.get("/portal/broadcasts/preview")
