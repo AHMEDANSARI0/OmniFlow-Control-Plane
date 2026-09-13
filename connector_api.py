@@ -362,6 +362,203 @@ MAX_INGEST_MESSAGES = 100
 ALLOWED_DIRECTIONS = ("in", "out")
 
 
+_AWAY_TABLE_READY = False
+AWAY_COOLDOWN_HOURS = 4
+_AWAY_DEFAULTS = {
+    "enabled": False,
+    "timezone": "Asia/Karachi",
+    "days": [
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+    ],
+    "away_message": "",
+}
+
+
+def _ensure_away_table() -> None:
+    global _AWAY_TABLE_READY
+    if _AWAY_TABLE_READY:
+        return
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS " + portal_db._q("portal_away_replies") +
+                " (id BIGSERIAL PRIMARY KEY, client_id BIGINT NOT NULL,"
+                " conversation_id BIGINT, contact_id TEXT NOT NULL,"
+                " body TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',"
+                " result_note TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+                " sent_at TIMESTAMPTZ)"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS portal_away_pending_idx ON " +
+                portal_db._q("portal_away_replies") +
+                " (client_id, status, id)"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _AWAY_TABLE_READY = True
+
+
+def _load_business_hours(cur, client_id):
+    try:
+        cur.execute(
+            "SELECT settings -> 'business_hours' AS business_hours FROM " +
+            portal_db._q("client_settings") +
+            " WHERE client_id = %s",
+            (client_id,),
+        )
+        rows = portal_db.rows(cur)
+    except Exception:
+        return _AWAY_DEFAULTS
+    stored = rows[0].get("business_hours") if rows and rows[0] else None
+    return stored if isinstance(stored, dict) else _AWAY_DEFAULTS
+
+
+def _away_closed_now(config) -> bool:
+    try:
+        from zoneinfo import ZoneInfo
+
+        days = config.get("days")
+        if not isinstance(days, list) or len(days) != 7:
+            return False
+        now = datetime.now(ZoneInfo(str(config.get("timezone") or "UTC")))
+        day = days[(now.weekday() + 1) % 7]
+        if not isinstance(day, dict) or day.get("enabled") is not True:
+            return True
+        current = now.strftime("%H:%M")
+        start = day.get("start")
+        end = day.get("end")
+        if not isinstance(start, str) or not isinstance(end, str):
+            return True
+        return not (start <= current <= end)
+    except Exception:
+        return False
+
+
+def _maybe_enqueue_away_reply(client_id, conversation_id, contact_id, direction, conn):
+    """Queue one automatic away reply, inside the ingest transaction.
+
+    Fires only for inbound messages while business hours are enabled and
+    currently closed, at most once per conversation per cooldown window.
+    Never raises into the caller: wrap in try/except there.
+    """
+    if direction != "in":
+        return
+    with conn.cursor() as cur:
+        config = _load_business_hours(cur, client_id)
+        message = config.get("away_message")
+        if (
+            config.get("enabled") is not True
+            or not isinstance(message, str)
+            or not message.strip()
+        ):
+            return
+        if not _away_closed_now(config):
+            return
+        cur.execute(
+            "SELECT 1 FROM " + portal_db._q("portal_away_replies") +
+            " WHERE client_id = %s AND conversation_id = %s"
+            " AND created_at > NOW() - INTERVAL '" +
+            str(AWAY_COOLDOWN_HOURS) + " hours'"
+            " LIMIT 1",
+            (client_id, conversation_id),
+        )
+        if portal_db.rows(cur):
+            return
+        cur.execute(
+            "INSERT INTO " + portal_db._q("portal_away_replies") +
+            " (client_id, conversation_id, contact_id, body)"
+            " VALUES (%s, %s, %s, %s)",
+            (client_id, conversation_id, contact_id, message.strip()),
+        )
+
+
+@bp.get("/away-replies")
+def list_due_away_replies():
+    args = request.args
+    tenant, error = _tenant_or_error(args.get("client_id"))
+    if error:
+        return error
+    limit = _query_int("limit", 5, 1, 20)
+
+    try:
+        _ensure_away_table()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, contact_id, body, created_at FROM " +
+                    portal_db._q("portal_away_replies") +
+                    " WHERE client_id = %s AND status = 'pending'"
+                    " ORDER BY id ASC LIMIT %s",
+                    (tenant["client_id"], limit),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "away replies read")[0]), 503
+
+    replies = []
+    for row in found:
+        created = row.get("created_at")
+        if isinstance(created, datetime) and created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        replies.append({
+            "id": row.get("id"),
+            "external_user_id": row.get("contact_id"),
+            "body": row.get("body"),
+            "created_at": created.isoformat() if isinstance(created, datetime) else None,
+        })
+    return jsonify({"away_replies": replies}), 200
+
+
+@bp.post("/away-replies/ack")
+def ack_away_reply():
+    payload = _json_body()
+    tenant, error = _tenant_or_error(payload.get("client_id"))
+    if error:
+        return error
+
+    away_id = payload.get("away_id")
+    if isinstance(away_id, bool) or not isinstance(away_id, int) or away_id <= 0:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "away_id (positive int) zaroori hai."}}), 400
+    ok_flag = payload.get("ok") is True
+    note = payload.get("note")
+    note = note if isinstance(note, str) else None
+
+    try:
+        _ensure_away_table()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q("portal_away_replies") +
+                    " SET status = %s, result_note = %s, sent_at = NOW()"
+                    " WHERE id = %s AND client_id = %s AND status = 'pending' RETURNING id",
+                    ("sent" if ok_flag else "failed", note, away_id, tenant["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "away ack")[0]), 503
+
+    if not updated:
+        return jsonify({"error": {"code": "not_found",
+                                  "message": "Away reply nahi mili."}}), 404
+    return jsonify({"ok": True}), 200
+
+
 @bp.post("/whatsapp/messages")
 def ingest_whatsapp_messages():
     """Store messages delivered by the customer's laptop connector.
@@ -547,6 +744,16 @@ def ingest_whatsapp_messages():
                             )
                         except Exception:
                             pass
+                    try:
+                        _maybe_enqueue_away_reply(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["direction"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
                     inserted += 1
             try:
                 portal_conversations.sweep_auto_close(
