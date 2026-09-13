@@ -1093,6 +1093,148 @@ def delete_saved_reply(reply_id: int):
 EXPORT_LIMIT = 500
 
 
+import json
+
+_DEFAULT_BUSINESS_HOURS = {
+    "enabled": False,
+    "timezone": "Asia/Karachi",
+    "days": [
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+        {"enabled": True, "start": "09:00", "end": "17:00"},
+    ],
+    "away_message": "Thanks for your message! Our team is currently offline. We will reply during business hours.",
+}
+
+_SETTINGS_TABLE_READY = False
+
+
+def _ensure_settings_table() -> None:
+    global _SETTINGS_TABLE_READY
+    if _SETTINGS_TABLE_READY:
+        return
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "CREATE TABLE IF NOT EXISTS " + portal_db._q("client_settings") +
+                " (client_id BIGINT PRIMARY KEY, settings JSONB NOT NULL DEFAULT '{}'::jsonb,"
+                " updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    _SETTINGS_TABLE_READY = True
+
+
+def _validate_business_hours(config) -> list:
+    problems = []
+    if not isinstance(config, dict):
+        return ["business_hours must be an object."]
+    if not isinstance(config.get("enabled"), bool):
+        problems.append("enabled must be a boolean.")
+    timezone = config.get("timezone")
+    if not isinstance(timezone, str) or not timezone or len(timezone) > 64:
+        problems.append("timezone must be a short string.")
+    days = config.get("days")
+    if not isinstance(days, list) or len(days) != 7:
+        problems.append("days must list all seven days.")
+    else:
+        for day in days:
+            if not isinstance(day, dict) or not isinstance(day.get("enabled"), bool):
+                problems.append("each day needs an enabled flag.")
+                break
+            for field in ("start", "end"):
+                value = day.get(field)
+                if (
+                    not isinstance(value, str)
+                    or len(value) != 5
+                    or value[2] != ":"
+                    or not value[:2].isdigit()
+                    or not value[3:].isdigit()
+                ):
+                    problems.append("day times must be HH:MM.")
+                    break
+    message = config.get("away_message")
+    if not isinstance(message, str) or len(message) > 500:
+        problems.append("away_message must be at most 500 characters.")
+    return problems
+
+
+@bp.get("/business-hours")
+def get_business_hours():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    try:
+        _ensure_settings_table()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT settings -> 'business_hours' AS business_hours FROM " +
+                    portal_db._q("client_settings") +
+                    " WHERE client_id = %s",
+                    (principal["client_id"],),
+                )
+                rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "business hours")[0]), 503
+
+    stored = rows[0].get("business_hours") if rows and rows[0] else None
+    config = stored if isinstance(stored, dict) else _DEFAULT_BUSINESS_HOURS
+    return jsonify({"business_hours": config}), 200
+
+
+@bp.put("/business-hours")
+def update_business_hours():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+
+    payload = request.get_json(silent=True) or {}
+    config = payload.get("business_hours")
+    problems = _validate_business_hours(config)
+    if problems:
+        return jsonify({"error": {"code": "bad_request", "message": " ".join(problems)}}), 400
+
+    try:
+        _ensure_settings_table()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q("client_settings") +
+                    " (client_id, settings) VALUES (%s, %s::jsonb)"
+                    " ON CONFLICT (client_id) DO UPDATE SET"
+                    " settings = client_settings.settings || EXCLUDED.settings,"
+                    " updated_at = NOW()",
+                    (principal["client_id"], json.dumps({"business_hours": config})),
+                )
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "business_hours.update",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Business hours updated.",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "business hours update")[0]), 503
+    return jsonify({"ok": True, "business_hours": config}), 200
+
+
 @bp.post("/conversations/read-all")
 def mark_all_conversations_read():
     principal, error = _principal_or_error()
