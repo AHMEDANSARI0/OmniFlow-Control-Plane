@@ -288,29 +288,24 @@ def list_conversations():
     counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0, "unread": 0}
     if include_counts:
         counts_sql = (
-            "SELECT COUNT(*) FILTER (WHERE EXISTS ("
-            " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
-            " nr WHERE nr.conversation_id = c.id"
-            " GROUP BY nr.conversation_id"
-            " HAVING COALESCE(MAX(CASE WHEN nr.direction = 'in' THEN nr.id END), 0)"
-            " > COALESCE(MAX(CASE WHEN nr.direction = 'out' THEN nr.id END), 0)"
-            " )) AS needs_reply,"
-            " COUNT(*) FILTER (WHERE EXISTS ("
-            " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
-            " od WHERE od.conversation_id = c.id"
-            " GROUP BY od.conversation_id"
-            " HAVING COALESCE(MAX(CASE WHEN od.direction = 'in' THEN od.id END), 0)"
-            " > COALESCE(MAX(CASE WHEN od.direction = 'out' THEN od.id END), 0)"
-            " AND MAX(CASE WHEN od.direction = 'in' THEN od.created_at END)"
-            " < NOW() - make_interval(hours => %s)"
-            " )) AS overdue,"
-            " COUNT(*) FILTER (WHERE EXISTS ("
-            " SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
-            " nb WHERE nb.conversation_id = c.id"
-            " AND nb.created_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0))"
-            " )) AS unread,"
+            " WITH recent AS ("
+            " SELECT m.conversation_id,"
+            " COALESCE(MAX(CASE WHEN m.direction = 'in' THEN m.id END), 0) AS last_in,"
+            " MAX(CASE WHEN m.direction = 'in' THEN m.created_at END) AS last_in_at,"
+            " COALESCE(MAX(CASE WHEN m.direction = 'out' THEN m.id END), 0) AS last_out"
+            " FROM " + portal_db._q(portal_db.MSGS_TABLE) + " m"
+            " JOIN " + portal_db._q(portal_db.CONV_TABLE) + " oc"
+            " ON oc.id = m.conversation_id"
+            " WHERE oc.client_id = %s AND oc.status = 'open'"
+            " GROUP BY m.conversation_id"
+            " )"
+            " SELECT COUNT(*) FILTER (WHERE recent.last_in > recent.last_out) AS needs_reply,"
+            " COUNT(*) FILTER (WHERE recent.last_in > recent.last_out"
+            " AND recent.last_in_at < NOW() - make_interval(hours => %s)) AS overdue,"
+            " COUNT(*) FILTER (WHERE recent.last_in_at > COALESCE(c.last_read_at, TO_TIMESTAMP(0))) AS unread,"
             " COUNT(*) FILTER (WHERE c.assigned_to IS NULL) AS unassigned"
             " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+            " LEFT JOIN recent ON recent.conversation_id = c.id"
             " WHERE c.client_id = %s AND c.status = 'open'"
         )
         try:
@@ -318,7 +313,7 @@ def list_conversations():
             conn = portal_db._conn()
             try:
                 with conn.cursor() as cur:
-                    cur.execute(counts_sql, (OVERDUE_HOURS, principal["client_id"]))
+                    cur.execute(counts_sql, (principal["client_id"], OVERDUE_HOURS, principal["client_id"]))
                     summary = portal_db.rows(cur)
                     if summary:
                         counts = {
@@ -1546,6 +1541,11 @@ def _ensure_star_column(conn) -> None:
         cur.execute(
             "ALTER TABLE " + portal_db._q(portal_db.CONV_TABLE) +
             " ADD COLUMN IF NOT EXISTS starred BOOLEAN NOT NULL DEFAULT FALSE"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_portal_messages_conv_dir"
+            " ON " + portal_db._q(portal_db.MSGS_TABLE) +
+            " (conversation_id, direction, id)"
         )
     conn.commit()
     _STAR_COLUMN_READY = True
