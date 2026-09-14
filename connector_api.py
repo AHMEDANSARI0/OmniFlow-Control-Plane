@@ -38,6 +38,7 @@ import portal_conversations
 
 import portal_db
 import portal_cod
+import portal_sequences
 
 
 logger = logging.getLogger("omniflow.connector-api")
@@ -209,6 +210,14 @@ def list_commands():
                     import portal_webhooks
 
                     portal_webhooks.deliver_pending_webhooks(
+                        cur, tenant["client_id"], conn
+                    )
+                except Exception:
+                    pass
+                try:
+                    import portal_sequences
+
+                    portal_sequences.deliver_due_sequence_steps(
                         cur, tenant["client_id"], conn
                     )
                 except Exception:
@@ -777,6 +786,16 @@ def ingest_whatsapp_messages():
                             item["name"],
                             item["body"],
                             item["direction"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        portal_sequences.maybe_enroll_new_contact(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
                             conn,
                         )
                     except Exception:
