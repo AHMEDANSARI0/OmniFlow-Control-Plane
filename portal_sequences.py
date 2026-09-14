@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 SEQUENCES_TABLE = "portal_sequences"
 STEPS_TABLE = "portal_sequence_steps"
 ENROLLMENTS_TABLE = "portal_sequence_enrollments"
+SETTINGS_TABLE = "portal_sequence_settings"
 MAX_STEPS = 5
 MAX_BODY = 1000
 MAX_DELAY_HOURS = 168
@@ -103,6 +104,14 @@ def _ensure_seq_tables(conn) -> None:
         cur.execute(
             "ALTER TABLE " + portal_db._q(SEQUENCES_TABLE) +
             " ADD COLUMN IF NOT EXISTS trigger_keyword TEXT"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS " + portal_db._q(SETTINGS_TABLE) +
+            " (client_id BIGINT PRIMARY KEY,"
+            " quiet_enabled BOOLEAN NOT NULL DEFAULT FALSE,"
+            " quiet_start INT NOT NULL DEFAULT 22,"
+            " quiet_end INT NOT NULL DEFAULT 8,"
+            " utc_offset INT NOT NULL DEFAULT 5)"
         )
     conn.commit()
     _SEQ_DDL_READY = True
@@ -210,6 +219,99 @@ def list_sequences():
         logger.warning("sequences read failed: %s", error)
         return jsonify(portal_db.portal_unavailable(error, "sequences read")[0]), 503
     return jsonify({"sequences": result}), 200
+
+
+@bp.get("/sequences/settings")
+def get_sequence_settings():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT quiet_enabled, quiet_start, quiet_end, utc_offset FROM " +
+                    portal_db._q(SETTINGS_TABLE) +
+                    " WHERE client_id = %s",
+                    (principal["client_id"],),
+                )
+                rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "settings read")[0]), 503
+    row = rows[0] if rows else {}
+    return jsonify({
+        "quiet_enabled": row.get("quiet_enabled") is True,
+        "quiet_start": int(row.get("quiet_start") if row.get("quiet_start") is not None else 22),
+        "quiet_end": int(row.get("quiet_end") if row.get("quiet_end") is not None else 8),
+        "utc_offset": int(row.get("utc_offset") if row.get("utc_offset") is not None else 5),
+    }), 200
+
+
+@bp.put("/sequences/settings")
+def update_sequence_settings():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    enabled = payload.get("quiet_enabled")
+    if not isinstance(enabled, bool):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "quiet_enabled must be true or false."}}), 400
+
+    def _hour(value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+        return value if 0 <= value <= 23 else None
+
+    start = _hour(payload.get("quiet_start"))
+    end = _hour(payload.get("quiet_end"))
+    if start is None or end is None:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Hours must be integers from 0 to 23."}}), 400
+    offset = payload.get("utc_offset")
+    if isinstance(offset, bool) or not isinstance(offset, int) or not -12 <= offset <= 14:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "UTC offset must be between -12 and +14."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(SETTINGS_TABLE) +
+                    " (client_id, quiet_enabled, quiet_start, quiet_end, utc_offset)"
+                    " VALUES (%s, %s, %s, %s, %s)"
+                    " ON CONFLICT (client_id) DO UPDATE SET"
+                    " quiet_enabled = %s, quiet_start = %s, quiet_end = %s,"
+                    " utc_offset = %s",
+                    (principal["client_id"], enabled, start, end, offset,
+                     enabled, start, end, offset),
+                )
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "sequence.quiet_updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Night guard %s (%02d:00-%02d:00 UTC%+d)." % (
+                        "on" if enabled else "off", start, end, offset),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "settings update")[0]), 503
+    return jsonify({"ok": True}), 200
 
 
 @bp.post("/sequences")
@@ -729,8 +831,21 @@ def deliver_due_sequence_steps(cur, client_id: int, conn) -> int:
             " FROM " + portal_db._q(ENROLLMENTS_TABLE) + " e"
             " WHERE e.client_id = %s AND e.status = 'active'"
             " AND e.next_at <= NOW()"
+            " AND NOT EXISTS ("
+            " SELECT 1 FROM " + portal_db._q(SETTINGS_TABLE) + " q"
+            " WHERE q.client_id = %s AND q.quiet_enabled IS TRUE"
+            " AND ((q.quiet_start < q.quiet_end"
+            " AND (EXTRACT(HOUR FROM NOW() AT TIME ZONE 'UTC')::int + q.utc_offset)"
+            " % 24 >= q.quiet_start"
+            " AND (EXTRACT(HOUR FROM NOW() AT TIME ZONE 'UTC')::int + q.utc_offset)"
+            " % 24 < q.quiet_end)"
+            " OR (q.quiet_start > q.quiet_end"
+            " AND ((EXTRACT(HOUR FROM NOW() AT TIME ZONE 'UTC')::int + q.utc_offset)"
+            " % 24 >= q.quiet_start"
+            " OR (EXTRACT(HOUR FROM NOW() AT TIME ZONE 'UTC')::int + q.utc_offset)"
+            " % 24 < q.quiet_end)))"
             " ORDER BY e.next_at LIMIT 5",
-            (client_id,),
+            (client_id, client_id),
         )
         due = portal_db.rows(cur)
         sent = 0
