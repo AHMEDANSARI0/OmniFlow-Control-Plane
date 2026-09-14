@@ -612,6 +612,176 @@ def export_sequence_enrollments(sequence_id: int):
     )
 
 
+@bp.post("/sequences/<int:sequence_id>/enrollments/<int:enrollment_id>/pause")
+def pause_enrollment(sequence_id: int, enrollment_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " SET status = 'paused'"
+                    " WHERE id = %s AND client_id = %s AND sequence_id = %s"
+                    " AND status = 'active'"
+                    " RETURNING contact_name",
+                    (enrollment_id, principal["client_id"], sequence_id),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Enrollment not found or not active."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "sequence.enrollment_paused",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Enrollment for %s paused." % (
+                        rows[0].get("contact_name") or "customer"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "enrollment pause")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
+@bp.post("/sequences/<int:sequence_id>/enrollments/<int:enrollment_id>/resume")
+def resume_enrollment(sequence_id: int, enrollment_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " SET status = 'active'"
+                    " WHERE id = %s AND client_id = %s AND sequence_id = %s"
+                    " AND status = 'paused'"
+                    " RETURNING contact_name",
+                    (enrollment_id, principal["client_id"], sequence_id),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Enrollment not found or not paused."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "sequence.enrollment_resumed",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Enrollment for %s resumed." % (
+                        rows[0].get("contact_name") or "customer"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "enrollment resume")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
+@bp.post("/sequences/<int:sequence_id>/enrollments/pause-all")
+def pause_all_enrollments(sequence_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " SET status = 'paused'"
+                    " WHERE client_id = %s AND sequence_id = %s"
+                    " AND status = 'active'"
+                    " RETURNING id",
+                    (principal["client_id"], sequence_id),
+                )
+                rows = portal_db.rows(cur)
+                if rows:
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "sequence.enrollments_paused",
+                        "customer_user",
+                        principal.get("user_id"),
+                        None,
+                        "Paused %d enrollment(s)." % len(rows),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "enrollments pause")[0]), 503
+    return jsonify({"ok": True, "paused": len(rows)}), 200
+
+
+@bp.post("/sequences/<int:sequence_id>/enrollments/resume-all")
+def resume_all_enrollments(sequence_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " SET status = 'active'"
+                    " WHERE client_id = %s AND sequence_id = %s"
+                    " AND status = 'paused'"
+                    " RETURNING id",
+                    (principal["client_id"], sequence_id),
+                )
+                rows = portal_db.rows(cur)
+                if rows:
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "sequence.enrollments_resumed",
+                        "customer_user",
+                        principal.get("user_id"),
+                        None,
+                        "Resumed %d enrollment(s)." % len(rows),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "enrollments resume")[0]), 503
+    return jsonify({"ok": True, "resumed": len(rows)}), 200
+
+
 def _normalize_contact(value: Any) -> str:
     """Normalize a pasted phone number or id to the WhatsApp jid form."""
     text = str(value or "").strip()
