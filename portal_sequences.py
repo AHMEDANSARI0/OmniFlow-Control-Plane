@@ -1,9 +1,11 @@
 """Deterministic multi-step sequences for brand-new contacts."""
 
+import csv
+import io
 import logging
 from typing import Any, Dict, Optional
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
 from portal_auth import (
     PortalAuthUnavailable,
@@ -147,7 +149,8 @@ def _steps_public(rows) -> list:
     ]
 
 
-def _sequence_public(row: Dict[str, Any], steps, active_count: int) -> dict:
+def _sequence_public(row: Dict[str, Any], steps, active_count: int,
+                     completed_count: int = 0) -> dict:
     return {
         "id": row.get("id"),
         "name": row.get("name") or "",
@@ -155,6 +158,7 @@ def _sequence_public(row: Dict[str, Any], steps, active_count: int) -> dict:
         "created_at": _iso(row.get("created_at")),
         "steps": steps,
         "active_enrollments": active_count,
+        "completed_enrollments": completed_count,
         "trigger_keyword": row.get("trigger_keyword") or None,
     }
 
@@ -191,7 +195,15 @@ def list_sequences():
                     )
                     counts = portal_db.rows(cur)
                     active_count = int(counts[0].get("total") or 0) if counts else 0
-                    result.append(_sequence_public(row, steps, active_count))
+                    cur.execute(
+                        "SELECT COUNT(*) AS total FROM " + portal_db._q(ENROLLMENTS_TABLE) +
+                        " WHERE client_id = %s AND sequence_id = %s AND status = 'completed'",
+                        (principal["client_id"], row.get("id")),
+                    )
+                    dones = portal_db.rows(cur)
+                    completed_count = int(dones[0].get("total") or 0) if dones else 0
+                    result.append(_sequence_public(row, steps, active_count,
+                                                   completed_count))
         finally:
             conn.close()
     except Exception as error:
@@ -445,6 +457,57 @@ def list_enrollments(sequence_id: int):
         }
         for row in found
     ]}), 200
+
+
+@bp.get("/sequences/<int:sequence_id>/enrollments/export")
+def export_sequence_enrollments(sequence_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, name FROM " + portal_db._q(SEQUENCES_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (sequence_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Sequence not found."}}), 404
+                cur.execute(
+                    "SELECT contact_name, contact_id, status, current_step, enrolled_at"
+                    " FROM " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " WHERE client_id = %s AND sequence_id = %s"
+                    " ORDER BY id DESC LIMIT 2000",
+                    (principal["client_id"], sequence_id),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "enrollments export")[0]), 503
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["contact_name", "contact_id", "status", "current_step",
+                     "enrolled_at"])
+    for row in found:
+        writer.writerow([
+            row.get("contact_name") or "",
+            row.get("contact_id") or "",
+            row.get("status") or "active",
+            int(row.get("current_step") or 0),
+            _iso(row.get("enrolled_at")) or "",
+        ])
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition":
+                 "attachment; filename=sequence-%d-enrollments.csv" % sequence_id},
+    )
 
 
 def _normalize_contact(value: Any) -> str:
