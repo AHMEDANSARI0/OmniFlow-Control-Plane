@@ -309,6 +309,58 @@ def update_sequence(sequence_id: int):
     return jsonify({"ok": True}), 200
 
 
+@bp.put("/sequences/<int:sequence_id>/steps")
+def replace_sequence_steps(sequence_id: int):
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM " + portal_db._q(SEQUENCES_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (sequence_id, principal["client_id"]),
+                )
+                found = portal_db.rows(cur)
+                if not found:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Sequence not found."}}), 404
+                cur.execute(
+                    "DELETE FROM " + portal_db._q(STEPS_TABLE) +
+                    " WHERE client_id = %s AND sequence_id = %s",
+                    (principal["client_id"], sequence_id),
+                )
+                count = _parse_steps(payload.get("steps"), principal["client_id"],
+                                     sequence_id, cur)
+                if count is None:
+                    conn.rollback()
+                    return jsonify({"error": {"code": "bad_request",
+                                              "message": "Steps: 1 to 5, each with text and a 0-168h delay."}}), 400
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "sequence.steps_updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Sequence #%d now has %d step(s)." % (sequence_id, count),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "sequence steps update")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
 @bp.delete("/sequences/<int:sequence_id>")
 def delete_sequence(sequence_id: int):
     principal, error = _principal_or_error()
