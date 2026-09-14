@@ -48,6 +48,14 @@ def _iso(value: Any) -> Optional[str]:
         return None
 
 
+def _normalize_keyword(raw: Any) -> Optional[str]:
+    """Lowercase, collapse spaces, cap at 32 chars; None when blank."""
+    text = " ".join(str(raw or "").split()).lower()
+    if not text:
+        return None
+    return text[:32]
+
+
 def _ensure_seq_tables(conn) -> None:
     global _SEQ_DDL_READY
     if _SEQ_DDL_READY:
@@ -89,6 +97,10 @@ def _ensure_seq_tables(conn) -> None:
             "CREATE INDEX IF NOT EXISTS idx_sequence_enrollments_due"
             " ON " + portal_db._q(ENROLLMENTS_TABLE) +
             " (client_id, status, next_at)"
+        )
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(SEQUENCES_TABLE) +
+            " ADD COLUMN IF NOT EXISTS trigger_keyword TEXT"
         )
     conn.commit()
     _SEQ_DDL_READY = True
@@ -143,6 +155,7 @@ def _sequence_public(row: Dict[str, Any], steps, active_count: int) -> dict:
         "created_at": _iso(row.get("created_at")),
         "steps": steps,
         "active_enrollments": active_count,
+        "trigger_keyword": row.get("trigger_keyword") or None,
     }
 
 
@@ -206,11 +219,13 @@ def create_sequence():
         try:
             _ensure_seq_tables(conn)
             with conn.cursor() as cur:
+                keyword = _normalize_keyword(payload.get("trigger_keyword"))
                 cur.execute(
                     "INSERT INTO " + portal_db._q(SEQUENCES_TABLE) +
-                    " (client_id, name, enabled) VALUES (%s, %s, FALSE)"
-                    " RETURNING id, name, enabled, created_at",
-                    (principal["client_id"], name),
+                    " (client_id, name, enabled, trigger_keyword)"
+                    " VALUES (%s, %s, FALSE, %s)"
+                    " RETURNING id, name, enabled, created_at, trigger_keyword",
+                    (principal["client_id"], name, keyword),
                 )
                 rows = portal_db.rows(cur)
                 created = rows[0] if rows else {}
@@ -257,6 +272,9 @@ def update_sequence(sequence_id: int):
                                       "message": "Name cannot be empty."}}), 400
         changes.append("name = %s")
         params.append(name)
+    if "trigger_keyword" in payload:
+        changes.append("trigger_keyword = %s")
+        params.append(_normalize_keyword(payload.get("trigger_keyword")))
     if "enabled" in payload:
         if not isinstance(payload.get("enabled"), bool):
             return jsonify({"error": {"code": "bad_request",
@@ -377,6 +395,135 @@ def list_enrollments(sequence_id: int):
     ]}), 200
 
 
+def _normalize_contact(value: Any) -> str:
+    """Normalize a pasted phone number or id to the WhatsApp jid form."""
+    text = str(value or "").strip()
+    for char in (" ", "-", "(", ")"):
+        text = text.replace(char, "")
+    if not text:
+        return ""
+    if "@" not in text:
+        text = text.lstrip("+") + "@c.us"
+    return text
+
+
+@bp.post("/sequences/<int:sequence_id>/enrollments")
+def enroll_contacts(sequence_id: int):
+    """Manually enroll pasted contacts into a sequence."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    payload = request.get_json(silent=True) or {}
+    raw = payload.get("contacts")
+    if not isinstance(raw, list):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "contacts must be a list."}}), 400
+    seen: list = []
+    for item in raw[:50]:
+        contact = _normalize_contact(item)
+        if contact and contact not in seen:
+            seen.append(contact)
+    if not seen:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "No valid contacts."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(SEQUENCES_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (sequence_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Sequence not found."}}), 404
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " (client_id, sequence_id, conversation_id, contact_id,"
+                    " contact_name, current_step, next_at)"
+                    " SELECT %s, %s, c.id, c.contact_id, c.contact_name, 0,"
+                    " NOW() + make_interval(hours => COALESCE(MIN(st.delay_hours), 0))"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+                    " LEFT JOIN " + portal_db._q(STEPS_TABLE) +
+                    " st ON st.sequence_id = %s AND st.step_no = 1"
+                    " WHERE c.client_id = %s AND c.contact_id = ANY(%s)"
+                    " AND NOT EXISTS (SELECT 1 FROM " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " e WHERE e.sequence_id = %s AND e.conversation_id = c.id)"
+                    " GROUP BY c.id, c.contact_id, c.contact_name"
+                    " RETURNING contact_id",
+                    (principal["client_id"], sequence_id, sequence_id,
+                     principal["client_id"], seen, sequence_id),
+                )
+                enrolled_rows = portal_db.rows(cur)
+                enrolled_ids = {row.get("contact_id") for row in enrolled_rows}
+                skipped = [c for c in seen if c not in enrolled_ids]
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "sequence.enrolled_manually",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Enrolled " + str(len(enrolled_rows)) + " contact(s) into"
+                    " sequence " + str(sequence_id) + ".",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "sequence enroll")[0]), 503
+    return jsonify({"enrolled": len(enrolled_rows), "skipped": skipped}), 200
+
+
+@bp.delete("/sequences/<int:sequence_id>/enrollments/<int:enrollment_id>")
+def cancel_enrollment(sequence_id: int, enrollment_id: int):
+    """Stop an active enrollment."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(SEQUENCES_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (sequence_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Sequence not found."}}), 404
+                cur.execute(
+                    "UPDATE " + portal_db._q(ENROLLMENTS_TABLE) +
+                    " SET status = 'cancelled'"
+                    " WHERE id = %s AND sequence_id = %s AND client_id = %s"
+                    " AND status = 'active' RETURNING id",
+                    (enrollment_id, sequence_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Enrollment not found or not active."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "sequence.enrollment_cancelled",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    "Cancelled enrollment " + str(enrollment_id) + ".",
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "enrollment cancel")[0]), 503
+    return jsonify({"ok": True}), 200
+
 def maybe_enroll_new_contact(client_id, conversation_id, contact_id,
                              contact_name, conn) -> None:
     """Ingest hook: enroll contacts whose conversation has one message."""
@@ -411,6 +558,46 @@ def maybe_enroll_new_contact(client_id, conversation_id, contact_id,
                 None,
                 conversation_id,
                 "Enrolled " + str(len(enrolled)) + " sequence(s).",
+            )
+
+
+def maybe_enroll_keyword(client_id, conversation_id, contact_id,
+                         contact_name, body, conn) -> None:
+    """Ingest hook: enroll a contact when their message matches a trigger."""
+    keyword = _normalize_keyword(body)
+    if not keyword:
+        return
+    portal_db.ensure_tables()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO " + portal_db._q(ENROLLMENTS_TABLE) +
+            " (client_id, sequence_id, conversation_id, contact_id,"
+            " contact_name, current_step, next_at)"
+            " SELECT %s, s.id, %s, %s, %s, 0,"
+            " NOW() + make_interval(hours => COALESCE(MIN(st.delay_hours), 0))"
+            " FROM " + portal_db._q(SEQUENCES_TABLE) + " s"
+            " LEFT JOIN " + portal_db._q(STEPS_TABLE) +
+            " st ON st.sequence_id = s.id AND st.step_no = 1"
+            " WHERE s.client_id = %s AND s.enabled IS TRUE"
+            " AND s.trigger_keyword = %s"
+            " AND NOT EXISTS (SELECT 1 FROM " + portal_db._q(ENROLLMENTS_TABLE) +
+            " e WHERE e.sequence_id = s.id AND e.conversation_id = %s)"
+            " GROUP BY s.id"
+            " RETURNING id",
+            (client_id, conversation_id, str(contact_id or ""),
+             str(contact_name or ""), client_id, keyword, conversation_id),
+        )
+        enrolled = portal_db.rows(cur)
+        if enrolled:
+            portal_db.log_action(
+                cur,
+                client_id,
+                "sequence.enrolled_keyword",
+                "automation",
+                None,
+                conversation_id,
+                "Keyword '" + keyword + "' enrolled " + str(len(enrolled))
+                + " sequence(s).",
             )
 
 

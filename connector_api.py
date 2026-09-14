@@ -800,6 +800,17 @@ def ingest_whatsapp_messages():
                         )
                     except Exception:
                         pass
+                    try:
+                        portal_sequences.maybe_enroll_keyword(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
+                            item["body"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
                     inserted += 1
             try:
                 portal_conversations.sweep_auto_close(
