@@ -25,7 +25,10 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from flask import Blueprint, jsonify, request
+import csv
+import io
+
+from flask import Blueprint, jsonify, request, Response
 
 from portal_auth import (
     PortalAuthUnavailable,
@@ -1411,6 +1414,146 @@ def export_conversations():
 
 CUSTOMERS_LIMIT = 100
 WARM_LEAD_SCORE = 35
+
+
+def _normalize_pk_phone(raw: str):
+    """Normalize PK numbers to 92xxxxxxxxxx; None when unusable."""
+    digits = "".join(ch for ch in str(raw or "") if ch.isdigit())
+    if digits.startswith("0092"):
+        digits = digits[4:]
+    elif digits.startswith("92"):
+        digits = digits[2:]
+    elif digits.startswith("0"):
+        digits = digits[1:]
+    if len(digits) == 10 and digits.startswith("3"):
+        digits = "92" + digits
+    if len(digits) < 10 or len(digits) > 12 or not digits.startswith("92"):
+        return None
+    if len(digits) != 12:
+        return None
+    return digits
+
+
+@bp.post("/customers/import")
+def import_customers():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    rows = payload.get("customers")
+    if not isinstance(rows, list) or not rows:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "customers list is required."}}), 400
+    if len(rows) > 300:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Import at most 300 customers per request."}}), 400
+    prepared = {}
+    invalid = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            invalid.append({"row": index + 1, "reason": "not an object"})
+            continue
+        name = str(row.get("name") or "").strip()[:120]
+        phone = _normalize_pk_phone(row.get("phone"))
+        if phone is None:
+            invalid.append({"row": index + 1, "reason": "unusable phone number"})
+            continue
+        prepared.setdefault(phone, name)
+    created = 0
+    merged = 0
+    if prepared:
+        try:
+            portal_db.ensure_tables()
+            conn = portal_db._conn()
+            try:
+                with conn.cursor() as cur:
+                    for phone, name in prepared.items():
+                        cur.execute(
+                            "INSERT INTO " + portal_db._q(portal_db.CONV_TABLE) +
+                            " (client_id, channel, contact_id, contact_name, status)"
+                            " VALUES (%s, 'whatsapp', %s, %s, 'open')"
+                            " ON CONFLICT (client_id, channel, contact_id) DO UPDATE"
+                            " SET contact_name = COALESCE(NULLIF(EXCLUDED.contact_name, ''),"
+                            " " + portal_db._q(portal_db.CONV_TABLE) + ".contact_name),"
+                            " updated_at = NOW()"
+                            " RETURNING (xmax = 0) AS created",
+                            (principal["client_id"], phone + "@c.us", name),
+                        )
+                        outcome = portal_db.rows(cur)
+                        if outcome and outcome[0].get("created"):
+                            created += 1
+                        else:
+                            merged += 1
+                    portal_db.log_action(
+                        cur,
+                        principal["client_id"],
+                        "customers.imported",
+                        "customer_user",
+                        principal.get("user_id"),
+                        None,
+                        "CSV import: " + str(created) + " new, "
+                        + str(merged) + " merged, "
+                        + str(len(invalid)) + " invalid.",
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception as error:
+            return jsonify(portal_db.portal_unavailable(error, "customers import")[0]), 503
+    return jsonify({"created": created, "merged": merged,
+                    "invalid": invalid[:20], "invalid_count": len(invalid)}), 200
+
+
+@bp.get("/customers/export")
+def export_customers_csv():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT c.contact_id,"
+                    " COALESCE(MAX(c.contact_name), '') AS name,"
+                    " COUNT(*) AS conversations,"
+                    " COUNT(*) FILTER (WHERE c.status = 'open') AS open_count,"
+                    " COALESCE(BOOL_OR(c.lead_temp = 'hot'), FALSE) AS has_hot,"
+                    " MAX(c.last_message_at) AS last_message_at"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+                    " WHERE c.client_id = %s"
+                    " GROUP BY c.contact_id"
+                    " ORDER BY MAX(c.last_message_at) DESC NULLS LAST, c.contact_id"
+                    " LIMIT 2000",
+                    (principal["client_id"],),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customers export")[0]), 503
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["contact_id", "name", "conversations", "open_chats",
+                     "hot_lead", "last_message_at"])
+    for row in found:
+        writer.writerow([
+            row.get("contact_id"),
+            row.get("name"),
+            row.get("conversations"),
+            row.get("open_count"),
+            "yes" if row.get("has_hot") else "no",
+            row.get("last_message_at").isoformat() if row.get("last_message_at") else "",
+        ])
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=omniflow-customers.csv"},
+    )
 
 
 @bp.get("/customers")
