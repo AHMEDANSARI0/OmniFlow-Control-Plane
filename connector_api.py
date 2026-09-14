@@ -205,6 +205,14 @@ def list_commands():
                     portal_growth.materialize_due_broadcasts(cur, tenant["client_id"], conn)
                 except Exception:
                     pass
+                try:
+                    import portal_webhooks
+
+                    portal_webhooks.deliver_pending_webhooks(
+                        cur, tenant["client_id"], conn
+                    )
+                except Exception:
+                    pass
                 cur.execute(
                     "SELECT id, action, payload, created_at FROM "
                     + portal_db._q(portal_db.CMD_TABLE) +
