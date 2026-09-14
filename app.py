@@ -32,6 +32,7 @@ from portal_analytics import bp as portal_analytics_bp  # noqa: E402
 from portal_revenue import bp as portal_revenue_bp  # noqa: E402
 from portal_team import bp as portal_team_bp  # noqa: E402
 from portal_growth import bp as portal_growth_bp  # noqa: E402
+from portal_cod import bp as portal_cod_bp  # noqa: E402
 from portal_widget import bp as portal_widget_bp  # noqa: E402
 from portal_auth import bind_root_application  # noqa: E402
 
@@ -56,6 +57,7 @@ aux_app.register_blueprint(portal_analytics_bp)
 aux_app.register_blueprint(portal_revenue_bp)
 aux_app.register_blueprint(portal_team_bp)
 aux_app.register_blueprint(portal_growth_bp)
+aux_app.register_blueprint(portal_cod_bp)
 aux_app.register_blueprint(portal_widget_bp)
 
 _EXTENSION_PREFIXES = (

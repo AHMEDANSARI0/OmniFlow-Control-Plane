@@ -37,6 +37,7 @@ import portal_growth
 import portal_conversations
 
 import portal_db
+import portal_cod
 
 
 logger = logging.getLogger("omniflow.connector-api")
@@ -755,6 +756,18 @@ def ingest_whatsapp_messages():
                             tenant["client_id"],
                             conversation_id,
                             item["from"],
+                            item["direction"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        portal_cod.maybe_cod_flow(
+                            tenant["client_id"],
+                            conversation_id,
+                            item["from"],
+                            item["name"],
+                            item["body"],
                             item["direction"],
                             conn,
                         )
