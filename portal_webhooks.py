@@ -356,6 +356,141 @@ def list_webhook_deliveries(webhook_id: int):
     return jsonify({"deliveries": [_delivery_public(row) for row in found]}), 200
 
 
+@bp.post("/webhooks/<int:webhook_id>/test")
+def test_webhook(webhook_id: int):
+    """Send a signed ping to the endpoint right now."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_webhook_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, url, secret FROM " + portal_db._q(WEBHOOKS_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (webhook_id, principal["client_id"]),
+                )
+                found = portal_db.rows(cur)
+                if not found:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Webhook not found."}}), 404
+                hook = found[0]
+                body = json.dumps({"event": "ping",
+                                   "data": {"source": "omniflow",
+                                            "webhook_id": webhook_id}})
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Omniflow-Event": "ping",
+                    "X-Omniflow-Signature":
+                        "sha256=" + _sign(str(hook.get("secret")), body),
+                }
+                status_code = 0
+                error_text = None
+                try:
+                    response = _http_post(str(hook.get("url")), headers, body)
+                    status_code = int(getattr(response, "status", 0) or 0)
+                except Exception as http_error:
+                    error_text = str(http_error)[:200]
+                delivered = 200 <= status_code < 300
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(DELIVERIES_TABLE) +
+                    " (webhook_id, client_id, event, action_log_id, payload,"
+                    " status_code, error, attempts, next_attempt_at, delivered_at)"
+                    " VALUES (%s, %s, 'ping', NULL, %s, %s, %s, 1, NOW(),"
+                    " CASE WHEN %s THEN NOW() ELSE NULL END)",
+                    (webhook_id, principal["client_id"], body,
+                     status_code if status_code else None, error_text, delivered),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "webhook test")[0]), 503
+    return jsonify({"ok": True, "delivered": delivered,
+                    "status_code": status_code if status_code else None,
+                    "error": error_text}), 200
+
+
+@bp.post("/webhooks/<int:webhook_id>/deliveries/<int:delivery_id>/retry")
+def retry_webhook_delivery(webhook_id: int, delivery_id: int):
+    """Attempt a failed delivery again right now."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_webhook_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(WEBHOOKS_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (webhook_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Webhook not found."}}), 404
+                cur.execute(
+                    "SELECT d.id, d.event, d.payload, d.attempts, d.delivered_at,"
+                    " w.url, w.secret"
+                    " FROM " + portal_db._q(DELIVERIES_TABLE) + " d"
+                    " JOIN " + portal_db._q(WEBHOOKS_TABLE) + " w ON w.id = d.webhook_id"
+                    " WHERE d.id = %s AND d.webhook_id = %s AND d.client_id = %s",
+                    (delivery_id, webhook_id, principal["client_id"]),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Delivery not found."}}), 404
+                row = rows[0]
+                if row.get("delivered_at"):
+                    return jsonify({"error": {"code": "bad_request",
+                                              "message": "Already delivered."}}), 400
+                body = json.dumps({"event": row.get("event"),
+                                   "data": row.get("payload")})
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-Omniflow-Event": str(row.get("event")),
+                    "X-Omniflow-Signature":
+                        "sha256=" + _sign(str(row.get("secret")), body),
+                }
+                status_code = 0
+                error_text = None
+                try:
+                    response = _http_post(str(row.get("url")), headers, body)
+                    status_code = int(getattr(response, "status", 0) or 0)
+                except Exception as http_error:
+                    error_text = str(http_error)[:200]
+                delivered = 200 <= status_code < 300
+                if delivered:
+                    cur.execute(
+                        "UPDATE " + portal_db._q(DELIVERIES_TABLE) +
+                        " SET status_code = %s, error = NULL, delivered_at = NOW()"
+                        " WHERE id = %s",
+                        (status_code, delivery_id),
+                    )
+                else:
+                    cur.execute(
+                        "UPDATE " + portal_db._q(DELIVERIES_TABLE) +
+                        " SET status_code = %s, error = %s, attempts = attempts + 1,"
+                        " next_attempt_at = NOW() + make_interval(mins => %s)"
+                        " WHERE id = %s",
+                        (status_code if status_code else None, error_text,
+                         2 * (int(row.get("attempts") or 0) + 1), delivery_id),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "webhook retry")[0]), 503
+    return jsonify({"ok": True, "delivered": delivered,
+                    "status_code": status_code if status_code else None}), 200
+
+
 def _sign(secret: str, body: str) -> str:
     return hmac.new(secret.encode("utf-8"), body.encode("utf-8"),
                     hashlib.sha256).hexdigest()
