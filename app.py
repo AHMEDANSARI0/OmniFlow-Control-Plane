@@ -33,6 +33,7 @@ from portal_revenue import bp as portal_revenue_bp  # noqa: E402
 from portal_team import bp as portal_team_bp  # noqa: E402
 from portal_growth import bp as portal_growth_bp  # noqa: E402
 from portal_cod import bp as portal_cod_bp  # noqa: E402
+from portal_segments import bp as portal_segments_bp  # noqa: E402
 from portal_setup import bp as portal_setup_bp  # noqa: E402
 from portal_webhooks import bp as portal_webhooks_bp  # noqa: E402
 from portal_sequences import bp as portal_sequences_bp  # noqa: E402
@@ -61,6 +62,7 @@ aux_app.register_blueprint(portal_revenue_bp)
 aux_app.register_blueprint(portal_team_bp)
 aux_app.register_blueprint(portal_growth_bp)
 aux_app.register_blueprint(portal_cod_bp)
+aux_app.register_blueprint(portal_segments_bp)
 aux_app.register_blueprint(portal_setup_bp)
 aux_app.register_blueprint(portal_webhooks_bp)
 aux_app.register_blueprint(portal_sequences_bp)
