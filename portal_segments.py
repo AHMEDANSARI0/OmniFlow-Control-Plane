@@ -13,6 +13,7 @@ from portal_auth import (
 )
 import portal_db
 import portal_growth
+import portal_pipeline
 
 bp = Blueprint("portal_segments", __name__, url_prefix="/api/v1/portal")
 
@@ -82,6 +83,11 @@ def _parse_filters(raw: Any) -> Optional[Dict[str, Any]]:
         if value not in VALID_STATUS:
             return None
         clean["status"] = value
+    if "stage" in raw:
+        value = raw["stage"]
+        if value not in portal_pipeline.VALID_STAGE:
+            return None
+        clean["stage"] = value
     if "idle_days" in raw:
         value = raw["idle_days"]
         if isinstance(value, bool) or not isinstance(value, int):
@@ -101,12 +107,25 @@ def _parse_filters(raw: Any) -> Optional[Dict[str, Any]]:
 
 def _member_rows(cur, client_id: int, filters: Dict[str, Any],
                  limit: int) -> list:
+    join_sql = ""
+    if "stage" in filters:
+        cur.execute("SELECT to_regclass(%s)",
+                    (portal_pipeline.STAGE_TABLE,))
+        found = portal_db.rows(cur)
+        if not found or not found[0].get("to_regclass"):
+            return []
+        join_sql = (
+            " LEFT JOIN " + portal_db._q(portal_pipeline.STAGE_TABLE) + " s"
+            " ON s.client_id = c.client_id"
+            " AND s.contact_id = c.contact_id"
+        )
     sql = (
         "SELECT c.contact_id,"
         " MAX(c.contact_name) AS name,"
         " MAX(c.last_message_at) AS last_at,"
         " COUNT(*) AS chats"
         " FROM " + portal_db._q(portal_db.CONV_TABLE) + " c"
+        + join_sql +
         " WHERE c.client_id = %s"
     )
     params: list = [client_id]
@@ -116,6 +135,9 @@ def _member_rows(cur, client_id: int, filters: Dict[str, Any],
     if "status" in filters:
         sql += " AND c.status = %s"
         params.append(filters["status"])
+    if "stage" in filters:
+        sql += " AND COALESCE(s.stage, 'new') = %s"
+        params.append(filters["stage"])
     if "tag" in filters:
         sql += (
             " AND EXISTS (SELECT 1 FROM " +
