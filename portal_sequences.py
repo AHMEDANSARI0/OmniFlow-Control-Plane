@@ -23,6 +23,7 @@ SEQUENCES_TABLE = "portal_sequences"
 STEPS_TABLE = "portal_sequence_steps"
 ENROLLMENTS_TABLE = "portal_sequence_enrollments"
 SETTINGS_TABLE = "portal_sequence_settings"
+STEP_LOG_TABLE = "portal_sequence_step_log"
 MAX_STEPS = 5
 MAX_BODY = 1000
 MAX_DELAY_HOURS = 168
@@ -113,6 +114,29 @@ def _ensure_seq_tables(conn) -> None:
             " quiet_end INT NOT NULL DEFAULT 8,"
             " utc_offset INT NOT NULL DEFAULT 5)"
         )
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(SEQUENCES_TABLE) +
+            " ADD COLUMN IF NOT EXISTS pause_on_reply BOOLEAN NOT NULL DEFAULT TRUE"
+        )
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(STEPS_TABLE) +
+            " ADD COLUMN IF NOT EXISTS only_if_idle_hours INT"
+        )
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS " + portal_db._q(STEP_LOG_TABLE) +
+            " (id BIGSERIAL PRIMARY KEY,"
+            " client_id BIGINT NOT NULL,"
+            " sequence_id BIGINT NOT NULL,"
+            " enrollment_id BIGINT NOT NULL,"
+            " step_no INT NOT NULL,"
+            " action TEXT NOT NULL,"
+            " created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sequence_step_log"
+            " ON " + portal_db._q(STEP_LOG_TABLE) +
+            " (client_id, sequence_id, step_no)"
+        )
     conn.commit()
     _SEQ_DDL_READY = True
 
@@ -136,13 +160,24 @@ def _parse_steps(raw: Any, client_id: int, sequence_id: int, cur) -> Optional[in
             return None
         if index == 0 and delay < 0:
             return None
-        cleaned.append((index + 1, delay, body))
-    for step_no, delay, body in cleaned:
+        idle_raw = item.get("only_if_idle_hours")
+        if idle_raw is None or idle_raw == "":
+            idle_value = None
+        else:
+            try:
+                idle_value = int(idle_raw)
+            except (TypeError, ValueError):
+                return None
+            if idle_value < 1 or idle_value > MAX_DELAY_HOURS:
+                return None
+        cleaned.append((index + 1, delay, body, idle_value))
+    for step_no, delay, body, idle_value in cleaned:
         cur.execute(
             "INSERT INTO " + portal_db._q(STEPS_TABLE) +
-            " (client_id, sequence_id, step_no, delay_hours, body)"
-            " VALUES (%s, %s, %s, %s, %s)",
-            (client_id, sequence_id, step_no, delay, body),
+            " (client_id, sequence_id, step_no, delay_hours, body,"
+            " only_if_idle_hours)"
+            " VALUES (%s, %s, %s, %s, %s, %s)",
+            (client_id, sequence_id, step_no, delay, body, idle_value),
         )
     return len(cleaned)
 
@@ -153,6 +188,10 @@ def _steps_public(rows) -> list:
             "step_no": int(row.get("step_no") or 0),
             "delay_hours": int(row.get("delay_hours") or 0),
             "body": row.get("body") or "",
+            "only_if_idle_hours": (
+                int(row["only_if_idle_hours"])
+                if row.get("only_if_idle_hours") is not None else None
+            ),
         }
         for row in rows
     ]
@@ -169,6 +208,7 @@ def _sequence_public(row: Dict[str, Any], steps, active_count: int,
         "active_enrollments": active_count,
         "completed_enrollments": completed_count,
         "trigger_keyword": row.get("trigger_keyword") or None,
+        "pause_on_reply": row.get("pause_on_reply") is not False,
     }
 
 
@@ -184,7 +224,7 @@ def list_sequences():
             _ensure_seq_tables(conn)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, name, enabled, created_at FROM " + portal_db._q(SEQUENCES_TABLE) +
+                    "SELECT id, name, enabled, created_at, trigger_keyword, pause_on_reply FROM " + portal_db._q(SEQUENCES_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT 20",
                     (principal["client_id"],),
                 )
@@ -192,7 +232,7 @@ def list_sequences():
                 result = []
                 for row in sequences:
                     cur.execute(
-                        "SELECT step_no, delay_hours, body FROM " + portal_db._q(STEPS_TABLE) +
+                        "SELECT step_no, delay_hours, body, only_if_idle_hours FROM " + portal_db._q(STEPS_TABLE) +
                         " WHERE client_id = %s AND sequence_id = %s ORDER BY step_no",
                         (principal["client_id"], row.get("id")),
                     )
@@ -389,6 +429,12 @@ def update_sequence(sequence_id: int):
     if "trigger_keyword" in payload:
         changes.append("trigger_keyword = %s")
         params.append(_normalize_keyword(payload.get("trigger_keyword")))
+    if "pause_on_reply" in payload:
+        if not isinstance(payload.get("pause_on_reply"), bool):
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "pause_on_reply must be true or false."}}), 400
+        changes.append("pause_on_reply = %s")
+        params.append(payload.get("pause_on_reply"))
     if "enabled" in payload:
         if not isinstance(payload.get("enabled"), bool):
             return jsonify({"error": {"code": "bad_request",
@@ -610,6 +656,50 @@ def export_sequence_enrollments(sequence_id: int):
         headers={"Content-Disposition":
                  "attachment; filename=sequence-%d-enrollments.csv" % sequence_id},
     )
+
+
+@bp.get("/sequences/<int:sequence_id>/stats")
+def sequence_stats(sequence_id: int):
+    """Per-step sent/skipped funnel for one sequence."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_seq_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(SEQUENCES_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (sequence_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Sequence not found."}}), 404
+                cur.execute(
+                    "SELECT step_no,"
+                    " COUNT(*) FILTER (WHERE action = 'sent') AS sent,"
+                    " COUNT(*) FILTER (WHERE action = 'skipped') AS skipped"
+                    " FROM " + portal_db._q(STEP_LOG_TABLE) +
+                    " WHERE client_id = %s AND sequence_id = %s"
+                    " GROUP BY step_no ORDER BY step_no",
+                    (principal["client_id"], sequence_id),
+                )
+                rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "sequence stats")[0]), 503
+    return jsonify({"steps": [
+        {
+            "step_no": int(row.get("step_no") or 0),
+            "sent": int(row.get("sent") or 0),
+            "skipped": int(row.get("skipped") or 0),
+        }
+        for row in rows
+    ]}), 200
 
 
 @bp.post("/sequences/<int:sequence_id>/enrollments/<int:enrollment_id>/pause")
@@ -988,6 +1078,49 @@ def maybe_enroll_keyword(client_id, conversation_id, contact_id,
             )
 
 
+def maybe_auto_pause_replies(client_id: int, conversation_id: int, conn) -> int:
+    """Pause a conversation's running series when the customer replies.
+
+    Enrollments younger than 2 minutes are spared so the message that just
+    enrolled (keyword trigger) never pauses its own series.
+    """
+    try:
+        portal_db.ensure_tables()
+        _ensure_seq_tables(conn)
+    except Exception:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE " + portal_db._q(ENROLLMENTS_TABLE) + " e"
+                " SET status = 'paused'"
+                " FROM " + portal_db._q(SEQUENCES_TABLE) + " s"
+                " WHERE e.sequence_id = s.id"
+                " AND e.client_id = %s AND e.conversation_id = %s"
+                " AND e.status = 'active'"
+                " AND e.enrolled_at < NOW() - interval '2 minutes'"
+                " AND s.enabled IS TRUE AND s.pause_on_reply IS TRUE"
+                " RETURNING e.id",
+                (client_id, conversation_id),
+            )
+            rows = portal_db.rows(cur)
+            if not rows:
+                return 0
+            portal_db.log_action(
+                cur,
+                client_id,
+                "sequence.auto_paused",
+                "system",
+                None,
+                conversation_id,
+                "Auto-paused %d series after the customer replied." % len(rows),
+            )
+        conn.commit()
+        return len(rows)
+    except Exception:
+        return 0
+
+
 def deliver_due_sequence_steps(cur, client_id: int, conn) -> int:
     """Send due steps for active enrollments (max 5 per poll)."""
     try:
@@ -997,7 +1130,8 @@ def deliver_due_sequence_steps(cur, client_id: int, conn) -> int:
         return 0
     try:
         cur.execute(
-            "SELECT e.id, e.sequence_id, e.current_step, e.contact_id, e.contact_name"
+            "SELECT e.id, e.sequence_id, e.current_step, e.conversation_id,"
+            " e.contact_id, e.contact_name"
             " FROM " + portal_db._q(ENROLLMENTS_TABLE) + " e"
             " WHERE e.client_id = %s AND e.status = 'active'"
             " AND e.next_at <= NOW()"
@@ -1019,10 +1153,11 @@ def deliver_due_sequence_steps(cur, client_id: int, conn) -> int:
         )
         due = portal_db.rows(cur)
         sent = 0
+        skipped_count = 0
         for row in due:
             current_step = int(row.get("current_step") or 0)
             cur.execute(
-                "SELECT step_no, delay_hours, body FROM " + portal_db._q(STEPS_TABLE) +
+                "SELECT step_no, delay_hours, body, only_if_idle_hours FROM " + portal_db._q(STEPS_TABLE) +
                 " WHERE client_id = %s AND sequence_id = %s AND step_no > %s"
                 " ORDER BY step_no LIMIT 2",
                 (client_id, row.get("sequence_id"), current_step),
@@ -1036,14 +1171,27 @@ def deliver_due_sequence_steps(cur, client_id: int, conn) -> int:
                 )
                 continue
             step = upcoming[0]
-            display = str(row.get("contact_name") or "").strip()
-            body = str(step.get("body") or "").replace(
-                "{name}", (display.split(" ")[0] if display else "there")
-            )
-            portal_growth._send_command(
-                cur, client_id, str(row.get("contact_id") or ""), display,
-                body, "sequence", broadcast_id=None,
-            )
+            idle = step.get("only_if_idle_hours")
+            skip = False
+            if idle is not None:
+                cur.execute(
+                    "SELECT 1 FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+                    " WHERE client_id = %s AND conversation_id = %s"
+                    " AND direction = 'in'"
+                    " AND created_at > NOW() - make_interval(hours => %s)"
+                    " LIMIT 1",
+                    (client_id, row.get("conversation_id"), int(idle)),
+                )
+                skip = bool(portal_db.rows(cur))
+            if not skip:
+                display = str(row.get("contact_name") or "").strip()
+                body = str(step.get("body") or "").replace(
+                    "{name}", (display.split(" ")[0] if display else "there")
+                )
+                portal_growth._send_command(
+                    cur, client_id, str(row.get("contact_id") or ""), display,
+                    body, "sequence", broadcast_id=None,
+                )
             finished = len(upcoming) == 1
             if finished:
                 cur.execute(
@@ -1060,8 +1208,18 @@ def deliver_due_sequence_steps(cur, client_id: int, conn) -> int:
                     (int(step.get("step_no") or 0),
                      int(upcoming[1].get("delay_hours") or 0), row.get("id")),
                 )
-            sent += 1
-        if sent:
+            cur.execute(
+                "INSERT INTO " + portal_db._q(STEP_LOG_TABLE) +
+                " (client_id, sequence_id, enrollment_id, step_no, action)"
+                " VALUES (%s, %s, %s, %s, %s)",
+                (client_id, row.get("sequence_id"), row.get("id"),
+                 int(step.get("step_no") or 0), "skipped" if skip else "sent"),
+            )
+            if skip:
+                skipped_count += 1
+            else:
+                sent += 1
+        if sent or skipped_count:
             conn.commit()
         return sent
     except Exception as error:

@@ -811,6 +811,14 @@ def ingest_whatsapp_messages():
                         )
                     except Exception:
                         pass
+                    try:
+                        portal_sequences.maybe_auto_pause_replies(
+                            tenant["client_id"],
+                            conversation_id,
+                            conn,
+                        )
+                    except Exception:
+                        pass
                     inserted += 1
             try:
                 portal_conversations.sweep_auto_close(
