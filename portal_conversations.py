@@ -1656,6 +1656,154 @@ def list_customers():
     return jsonify({"customers": customers}), 200
 
 
+def _profile_table_exists(cur, table: str) -> bool:
+    """True when an optional module table exists (cod requests, sequences)."""
+    cur.execute("SELECT to_regclass(%s) AS oid", (table,))
+    rows = portal_db.rows(cur)
+    return bool(rows and rows[0].get("oid"))
+
+
+@bp.get("/customers/profile")
+def customer_profile():
+    """Everything the business knows about ONE customer, in one response."""
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    import portal_cod
+    import portal_sequences
+
+    contact = (request.args.get("contact") or "").strip()[:100]
+    if not contact:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "contact is required."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS chats,"
+                    " COUNT(*) FILTER (WHERE status = 'open') AS open_chats,"
+                    " COALESCE(MAX(contact_name), '') AS name,"
+                    " BOOL_OR(lead_temp = 'hot') AS has_hot,"
+                    " MAX(lead_score) AS max_lead_score,"
+                    " MIN(created_at) AS first_at,"
+                    " MAX(last_message_at) AS last_at"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND contact_id = %s",
+                    (principal["client_id"], contact),
+                )
+                summary_rows = portal_db.rows(cur)
+                summary = summary_rows[0] if summary_rows else {}
+                cur.execute(
+                    "SELECT id, status, channel, created_at, last_message_at"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND contact_id = %s"
+                    " ORDER BY last_message_at DESC NULLS LAST, id DESC LIMIT 20",
+                    (principal["client_id"], contact),
+                )
+                conversations = portal_db.rows(cur)
+                cur.execute(
+                    "SELECT DISTINCT ct.tag FROM "
+                    + portal_db._q(portal_db.CONV_TAGS_TABLE) + " ct"
+                    " JOIN " + portal_db._q(portal_db.CONV_TABLE) + " conv"
+                    " ON conv.id = ct.conversation_id"
+                    " WHERE ct.client_id = %s AND conv.client_id = %s"
+                    " AND conv.contact_id = %s ORDER BY ct.tag",
+                    (principal["client_id"], principal["client_id"], contact),
+                )
+                tags = [str(row.get("tag") or "") for row in portal_db.rows(cur)
+                        if row.get("tag")]
+                cod_requests = []
+                if _profile_table_exists(cur, portal_cod.COD_REQUESTS_TABLE):
+                    cur.execute(
+                        "SELECT id, status, created_at, answered_at FROM "
+                        + portal_db._q(portal_cod.COD_REQUESTS_TABLE) +
+                        " WHERE client_id = %s AND contact_id = %s"
+                        " ORDER BY id DESC LIMIT 10",
+                        (principal["client_id"], contact),
+                    )
+                    cod_requests = portal_db.rows(cur)
+                sequence_items = []
+                if _profile_table_exists(cur, portal_sequences.SEQUENCES_TABLE):
+                    cur.execute(
+                        "SELECT s.name AS name, e.status AS status,"
+                        " e.current_step AS current_step, e.enrolled_at AS enrolled_at"
+                        " FROM " + portal_db._q(portal_sequences.ENROLLMENTS_TABLE) +
+                        " e JOIN " + portal_db._q(portal_sequences.SEQUENCES_TABLE) +
+                        " s ON s.id = e.sequence_id"
+                        " WHERE e.client_id = %s AND e.contact_id = %s"
+                        " ORDER BY e.id DESC LIMIT 10",
+                        (principal["client_id"], contact),
+                    )
+                    sequence_items = portal_db.rows(cur)
+                cur.execute(
+                    "SELECT n.body, n.author_email, n.created_at FROM "
+                    + portal_db._q(portal_db.NOTES_TABLE) + " n"
+                    " JOIN " + portal_db._q(portal_db.CONV_TABLE) + " conv"
+                    " ON conv.id = n.conversation_id"
+                    " WHERE n.client_id = %s AND conv.client_id = %s"
+                    " AND conv.contact_id = %s"
+                    " ORDER BY n.id DESC LIMIT 10",
+                    (principal["client_id"], principal["client_id"], contact),
+                )
+                notes = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customer profile")[0]), 503
+    max_score = int(summary.get("max_lead_score") or 0)
+    lead_temp = "cold"
+    if summary.get("has_hot"):
+        lead_temp = "hot"
+    elif max_score >= WARM_LEAD_SCORE:
+        lead_temp = "warm"
+    return jsonify({
+        "contact_id": contact,
+        "name": str(summary.get("name") or ""),
+        "lead_temp": lead_temp,
+        "chats": int(summary.get("chats") or 0),
+        "open_chats": int(summary.get("open_chats") or 0),
+        "first_seen": _iso(summary.get("first_at")),
+        "last_seen": _iso(summary.get("last_at")),
+        "tags": tags,
+        "conversations": [
+            {
+                "id": int(row.get("id") or 0),
+                "status": row.get("status") or "open",
+                "channel": row.get("channel") or "whatsapp",
+                "last_message_at": _iso(row.get("last_message_at")),
+            }
+            for row in conversations
+        ],
+        "cod_requests": [
+            {
+                "id": int(row.get("id") or 0),
+                "status": row.get("status") or "pending",
+                "created_at": _iso(row.get("created_at")),
+                "answered_at": _iso(row.get("answered_at")),
+            }
+            for row in cod_requests
+        ],
+        "sequences": [
+            {
+                "name": row.get("name") or "",
+                "status": row.get("status") or "active",
+                "current_step": int(row.get("current_step") or 0),
+                "enrolled_at": _iso(row.get("enrolled_at")),
+            }
+            for row in sequence_items
+        ],
+        "notes": [
+            {
+                "body": row.get("body") or "",
+                "author_email": row.get("author_email") or "",
+                "created_at": _iso(row.get("created_at")),
+            }
+            for row in notes
+        ],
+    }), 200
+
 
 # ---------------------------------------------------------------------------
 # Automations v0 — deterministic keyword rules on inbound messages
