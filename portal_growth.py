@@ -143,7 +143,9 @@ def _resolve_recipients(cur, client_id, audience) -> List[Dict[str, Any]]:
 
 def _send_command(cur, client_id, external_user_id, display_name, body,
                   source, broadcast_id=None):
-    """Queue a WhatsApp send through the existing connector command queue."""
+    """Queue a customer send through the connector command queue. Telegram
+    contacts (tg: prefix) ride the telegram channel; opted-out contacts are
+    never queued."""
     payload: Dict[str, Any] = {
         "external_user_id": external_user_id,
         "body": str(body or "")[:1000],
@@ -154,14 +156,29 @@ def _send_command(cur, client_id, external_user_id, display_name, body,
         payload["target_display_name"] = display
     if broadcast_id is not None:
         payload["broadcast_id"] = int(broadcast_id)
-    cur.execute(
-        "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
-        " (client_id, channel, action, payload, status, requested_by,"
-        " created_at, updated_at) "
-        "VALUES (%s, 'whatsapp', 'send_message', CAST(%s AS JSONB),"
-        " 'pending', NULL, NOW(), NOW())",
-        (client_id, json.dumps(payload)),
-    )
+    contact = str(external_user_id or "").strip()
+    channel = "telegram" if contact.startswith("tg:") else "whatsapp"
+    try:
+        cur.execute(
+            "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
+            " (client_id, channel, action, payload, status, requested_by,"
+            " created_at, updated_at) "
+            "SELECT %s, %s, 'send_message', CAST(%s AS JSONB),"
+            " 'pending', NULL, NOW(), NOW()"
+            " WHERE NOT EXISTS (SELECT 1 FROM " + portal_db._q("portal_optouts") +
+            " WHERE client_id = %s AND contact_id = %s)",
+            (client_id, channel, json.dumps(payload), client_id, contact),
+        )
+    except Exception:
+        # Deployments without the opt-out table (compliance never used) still send.
+        cur.execute(
+            "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
+            " (client_id, channel, action, payload, status, requested_by,"
+            " created_at, updated_at) "
+            "VALUES (%s, %s, 'send_message', CAST(%s AS JSONB),"
+            " 'pending', NULL, NOW(), NOW())",
+            (client_id, channel, json.dumps(payload)),
+        )
 
 
 def _conversation_contact(cur, client_id, conversation_id):

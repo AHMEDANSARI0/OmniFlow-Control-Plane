@@ -37,6 +37,8 @@ from portal_segments import bp as portal_segments_bp  # noqa: E402
 from portal_pipeline import bp as portal_pipeline_bp  # noqa: E402
 from portal_insights import bp as portal_insights_bp  # noqa: E402
 from portal_contacts import bp as portal_contacts_bp  # noqa: E402
+from portal_fraud import bp as portal_fraud_bp  # noqa: E402
+from portal_compliance import bp as portal_compliance_bp  # noqa: E402
 from portal_setup import bp as portal_setup_bp  # noqa: E402
 from portal_webhooks import bp as portal_webhooks_bp  # noqa: E402
 from portal_sequences import bp as portal_sequences_bp  # noqa: E402
@@ -69,6 +71,8 @@ aux_app.register_blueprint(portal_segments_bp)
 aux_app.register_blueprint(portal_pipeline_bp)
 aux_app.register_blueprint(portal_insights_bp)
 aux_app.register_blueprint(portal_contacts_bp)
+aux_app.register_blueprint(portal_fraud_bp)
+aux_app.register_blueprint(portal_compliance_bp)
 aux_app.register_blueprint(portal_setup_bp)
 aux_app.register_blueprint(portal_webhooks_bp)
 aux_app.register_blueprint(portal_sequences_bp)

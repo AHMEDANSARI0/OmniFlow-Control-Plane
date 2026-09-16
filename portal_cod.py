@@ -284,6 +284,14 @@ def maybe_cod_flow(client_id, conversation_id, contact_id, contact_name,
                 conversation_id,
                 "COD request " + str(request_id) + " replied " + new_status + ".",
             )
+            if new_status == "declined":
+                try:
+                    import portal_fraud
+
+                    portal_fraud.on_cod_declined(
+                        cur, client_id, str(contact_id or ""))
+                except Exception:
+                    pass
             return
         cur.execute(
             " SELECT 1 FROM " + portal_db._q(portal_db.CONV_TABLE) +

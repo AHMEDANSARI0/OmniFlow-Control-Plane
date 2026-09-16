@@ -1916,6 +1916,117 @@ def _profile_table_exists(cur, table: str) -> bool:
     return bool(rows and rows[0].get("oid"))
 
 
+ASSIST_STOPWORDS = frozenset((
+    "the", "and", "you", "your", "with", "for", "from", "this", "that",
+    "have", "can", "are", "was", "were", "will", "would", "what", "when",
+    "where", "how", "does", "did", "please", "hey", "hi", "hello", "salam",
+))
+
+
+def _assist_tokens(text) -> set:
+    return set(re.findall(r"[a-z0-9]{3,}", str(text or "").lower())) - ASSIST_STOPWORDS
+
+
+@bp.get("/conversations/<int:conversation_id>/assist")
+def conversation_assist(conversation_id: int):
+    """Agent assist v0: deterministic reply suggestions from the knowledge
+    base (keyword overlap), plus intent / language / linked-contact hints."""
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    import portal_insights
+    import portal_kb
+
+    contact = None
+    inbound: list = []
+    kb_rows: list = []
+    lang_rows: list = []
+    identity_rows: list = []
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT contact_id FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (conversation_id, principal["client_id"]),
+                )
+                found = portal_db.rows(cur)
+                if not found:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Conversation not"
+                                                         " found."}}), 404
+                contact = str(found[0].get("contact_id") or "")
+                cur.execute(
+                    "SELECT body FROM " + portal_db._q(portal_db.MSGS_TABLE) +
+                    " WHERE conversation_id = %s AND client_id = %s"
+                    " AND direction = 'in' AND COALESCE(body, '') <> ''"
+                    " ORDER BY id DESC LIMIT 3",
+                    (conversation_id, principal["client_id"]),
+                )
+                inbound = portal_db.rows(cur)
+                if _profile_table_exists(cur, portal_kb.KB_TABLE):
+                    cur.execute(
+                        "SELECT id, question, answer FROM " +
+                        portal_db._q(portal_kb.KB_TABLE) +
+                        " WHERE client_id = %s ORDER BY id DESC LIMIT 200",
+                        (principal["client_id"],),
+                    )
+                    kb_rows = portal_db.rows(cur)
+                if _profile_table_exists(cur, "portal_contact_lang"):
+                    cur.execute(
+                        "SELECT lang FROM " + portal_db._q("portal_contact_lang") +
+                        " WHERE client_id = %s AND contact_id = %s",
+                        (principal["client_id"], contact),
+                    )
+                    lang_rows = portal_db.rows(cur)
+                if _profile_table_exists(cur, "portal_contact_identities"):
+                    cur.execute(
+                        "SELECT DISTINCT contact_id FROM " +
+                        portal_db._q("portal_contact_identities") +
+                        " WHERE client_id = %s AND identity_key IN"
+                        " (SELECT identity_key FROM " +
+                        portal_db._q("portal_contact_identities") +
+                        " WHERE client_id = %s AND contact_id = %s)"
+                        " ORDER BY contact_id",
+                        (principal["client_id"], principal["client_id"], contact),
+                    )
+                    identity_rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "agent assist")[0]), 503
+    text = " ".join(str(row.get("body") or "") for row in reversed(inbound))
+    tokens = _assist_tokens(text)
+    suggestions = []
+    for row in kb_rows:
+        q_tokens = _assist_tokens(str(row.get("question") or ""))
+        overlap = tokens & q_tokens
+        if not overlap:
+            continue
+        suggestions.append({
+            "id": int(row.get("id") or 0),
+            "question": str(row.get("question") or ""),
+            "snippet": str(row.get("answer") or "")[:160],
+            "matched": sorted(overlap)[:5],
+            "score": len(overlap),
+        })
+    suggestions.sort(key=lambda item: (-item["score"], item["id"]))
+    suggestions = suggestions[:2]
+    language = lang_rows[0].get("lang") if lang_rows else None
+    linked = [str(row.get("contact_id") or "") for row in identity_rows
+              if str(row.get("contact_id") or "")
+              and str(row.get("contact_id") or "") != contact]
+    return jsonify({
+        "intent": portal_insights.classify_intent(text[:1000]),
+        "language": language,
+        "linked": linked,
+        "suggestions": suggestions,
+        "based_on": text[:120],
+    }), 200
+
+
 @bp.get("/customers/profile")
 def customer_profile():
     """Everything the business knows about ONE customer, in one response."""
