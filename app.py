@@ -43,6 +43,8 @@ from portal_negotiation import bp as portal_negotiation_bp  # noqa: E402
 from portal_checkout import bp as portal_checkout_bp  # noqa: E402
 from portal_listen import bp as portal_listen_bp  # noqa: E402
 from portal_routing import bp as portal_routing_bp  # noqa: E402
+from portal_reco import bp as portal_reco_bp  # noqa: E402
+from portal_churn import bp as portal_churn_bp  # noqa: E402
 from portal_checkout import public_bp as portal_checkout_public_bp  # noqa: E402
 from portal_setup import bp as portal_setup_bp  # noqa: E402
 from portal_webhooks import bp as portal_webhooks_bp  # noqa: E402
@@ -82,6 +84,8 @@ aux_app.register_blueprint(portal_negotiation_bp)
 aux_app.register_blueprint(portal_checkout_bp)
 aux_app.register_blueprint(portal_listen_bp)
 aux_app.register_blueprint(portal_routing_bp)
+aux_app.register_blueprint(portal_reco_bp)
+aux_app.register_blueprint(portal_churn_bp)
 aux_app.register_blueprint(portal_checkout_public_bp)
 aux_app.register_blueprint(portal_setup_bp)
 aux_app.register_blueprint(portal_webhooks_bp)
