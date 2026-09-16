@@ -911,6 +911,172 @@ def remove_conversation_tag(conversation_id: int):
         return jsonify(portal_db.portal_unavailable(error, "label remove")[0]), 503
     return jsonify({"ok": True}), 200
 
+# ---------------------------------------------------------------------------
+# Saved replies v2 (editing + usage stats) and activity CSV export
+# ---------------------------------------------------------------------------
+
+_SAVED_USAGE_DDL_READY = False
+
+
+def _ensure_saved_usage_columns(conn) -> None:
+    """Usage columns landed in batch 281-295; older tables get them lazily."""
+    global _SAVED_USAGE_DDL_READY
+    if _SAVED_USAGE_DDL_READY:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+            " ADD COLUMN IF NOT EXISTS use_count INT NOT NULL DEFAULT 0"
+        )
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+            " ADD COLUMN IF NOT EXISTS last_used_at TIMESTAMPTZ"
+        )
+    conn.commit()
+    _SAVED_USAGE_DDL_READY = True
+
+
+@bp.put("/saved-replies/<int:reply_id>")
+def update_saved_reply(reply_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    shortcut = _clean_shortcut(payload.get("shortcut"))
+    if not shortcut:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Shortcut can use letters, numbers, dashes and underscores (max 24)."}}), 400
+    body_text = payload.get("body")
+    body_text = body_text.strip() if isinstance(body_text, str) else ""
+    if not body_text:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message text is required."}}), 400
+    if len(body_text) > MAX_REPLY_BODY:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Message must be 1000 characters or fewer."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id FROM "
+                    + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " WHERE client_id = %s AND LOWER(shortcut) = LOWER(%s)"
+                    " AND id <> %s LIMIT 1",
+                    (principal["client_id"], shortcut, reply_id),
+                )
+                if portal_db.rows(cur):
+                    return jsonify({"error": {"code": "duplicate",
+                                              "message": "A reply with this shortcut already exists."}}), 409
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " SET shortcut = %s, body = %s"
+                    " WHERE id = %s AND client_id = %s"
+                    " RETURNING id, shortcut, body, created_at",
+                    (shortcut, body_text, reply_id, principal["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+                if not updated:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Saved reply not found."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "saved_reply.updated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Saved reply updated: /" + shortcut)[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "saved reply update")[0]), 503
+    row = updated[0]
+    return jsonify({"ok": True, "reply": {
+        "id": int(row.get("id") or 0),
+        "shortcut": str(row.get("shortcut") or shortcut),
+        "body": str(row.get("body") or body_text),
+        "created_at": _iso(row.get("created_at")),
+    }}), 200
+
+
+@bp.post("/saved-replies/<int:reply_id>/use")
+def use_saved_reply(reply_id: int):
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_saved_usage_columns(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
+                    " SET use_count = COALESCE(use_count, 0) + 1,"
+                    " last_used_at = NOW()"
+                    " WHERE id = %s AND client_id = %s RETURNING id",
+                    (reply_id, principal["client_id"]),
+                )
+                if not portal_db.rows(cur):
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Saved reply not found."}}), 404
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "saved reply use")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
+@bp.get("/activity/export")
+def export_activity_csv():
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, created_at, action, actor_kind, note,"
+                    " conversation_id FROM " + portal_db._q("portal_action_log") +
+                    " WHERE client_id = %s"
+                    " ORDER BY created_at DESC, id DESC LIMIT 2000",
+                    (principal["client_id"],),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "activity export")[0]), 503
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["id", "created_at", "action", "actor", "note",
+                     "conversation_id"])
+    for row in found:
+        created = row.get("created_at")
+        conversation = row.get("conversation_id")
+        writer.writerow([
+            row.get("id"),
+            created.isoformat() if created else "",
+            row.get("action"),
+            row.get("actor_kind"),
+            str(row.get("note") or ""),
+            conversation if conversation is not None else "",
+        ])
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=omniflow-activity.csv"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -945,9 +1111,11 @@ def list_saved_replies():
         portal_db.ensure_tables()
         conn = portal_db._conn()
         try:
+            _ensure_saved_usage_columns(conn)
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, shortcut, body, created_at FROM "
+                    "SELECT id, shortcut, body, created_at,"
+                    " COALESCE(use_count, 0) AS use_count, last_used_at FROM "
                     + portal_db._q(portal_db.SAVED_REPLIES_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT %s",
                     (principal["client_id"], MAX_SAVED_REPLIES),
@@ -964,6 +1132,8 @@ def list_saved_replies():
             "shortcut": str(row.get("shortcut") or ""),
             "body": str(row.get("body") or ""),
             "created_at": _iso(row.get("created_at")),
+            "use_count": int(row.get("use_count") or 0),
+            "last_used_at": _iso(row.get("last_used_at")),
         }
         for row in rows
     ]}), 200
