@@ -1078,6 +1078,89 @@ def export_activity_csv():
         headers={"Content-Disposition": "attachment; filename=omniflow-activity.csv"},
     )
 
+@bp.post("/customers/merge")
+def merge_customers():
+    """Move one duplicate contact's history onto the kept contact."""
+    principal, error = _principal_or_error()
+    if error is not None:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    keep = str(payload.get("keep") or "").strip()[:100]
+    merge = str(payload.get("merge") or "").strip()[:100]
+    if not keep or not merge:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Both contacts are required."}}), 400
+    if keep == merge:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Pick two different contacts."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) AS total FROM "
+                    + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s AND contact_id = %s",
+                    (principal["client_id"], merge),
+                )
+                counts = portal_db.rows(cur)
+                merge_chats = int(counts[0].get("total") or 0) if counts else 0
+                if merge_chats == 0:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "The duplicate contact has no chats."}}), 404
+                cur.execute(
+                    "UPDATE " + portal_db._q(portal_db.CONV_TABLE) +
+                    " SET contact_id = %s"
+                    " WHERE client_id = %s AND contact_id = %s",
+                    (keep, principal["client_id"], merge),
+                )
+                stage_moved = 0
+                if _profile_table_exists(cur, "portal_contact_stage"):
+                    cur.execute(
+                        "DELETE FROM " + portal_db._q("portal_contact_stage") +
+                        " WHERE client_id = %s AND contact_id = %s"
+                        " AND EXISTS (SELECT 1 FROM "
+                        + portal_db._q("portal_contact_stage") + " k"
+                        " WHERE k.client_id = "
+                        + portal_db._q("portal_contact_stage") + ".client_id"
+                        " AND k.contact_id = %s)",
+                        (principal["client_id"], merge, keep),
+                    )
+                    cur.execute(
+                        "UPDATE " + portal_db._q("portal_contact_stage") +
+                        " SET contact_id = %s"
+                        " WHERE client_id = %s AND contact_id = %s",
+                        (keep, principal["client_id"], merge),
+                    )
+                    stage_moved = 1
+                if _profile_table_exists(cur, "portal_cod_requests"):
+                    cur.execute(
+                        "UPDATE " + portal_db._q("portal_cod_requests") +
+                        " SET contact_id = %s"
+                        " WHERE client_id = %s AND contact_id = %s",
+                        (keep, principal["client_id"], merge),
+                    )
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "customers.merged",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Merged " + merge + " into " + keep
+                     + " (" + str(merge_chats) + " chats moved).")[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(error, "customer merge")[0]), 503
+    return jsonify({"ok": True, "moved": merge_chats}), 200
+
 
 # ---------------------------------------------------------------------------
 # Saved replies (canned response templates for the shared inbox)
