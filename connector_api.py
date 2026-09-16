@@ -202,6 +202,12 @@ def list_commands():
                     import portal_growth
 
                     portal_growth.materialize_due_broadcasts(cur, tenant["client_id"], conn)
+                    import portal_checkout
+
+                    portal_checkout.materialize_cart_reminders(
+                        cur, tenant["client_id"], conn
+                    )
+
                 except Exception:
                     pass
                 try:

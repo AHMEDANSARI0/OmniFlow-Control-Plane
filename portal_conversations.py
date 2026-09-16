@@ -114,6 +114,34 @@ def _clean_tag(value: Any) -> str:
     return cleaned[:MAX_TAG_LENGTH]
 
 
+VIP_THRESHOLD = 3  # paid orders that turn a contact into a VIP
+
+
+def _paid_order_counts(cur, client_id, contact_ids):
+    """contact_id -> paid order count ({} when the links table is absent)."""
+    ids = sorted({str(cid).strip() for cid in contact_ids
+                  if cid and str(cid).strip()})
+    if not ids:
+        return {}
+    try:
+        cur.execute("SELECT to_regclass(%s) AS oid",
+                    ("portal_checkout_links",))
+        rows = portal_db.rows(cur)
+        if not rows or not rows[0].get("oid"):
+            return {}
+        cur.execute(
+            "SELECT contact_id, COUNT(*) AS orders FROM portal_checkout_links"
+            " WHERE client_id = %s AND status = 'paid'"
+            " AND contact_id = ANY(%s)"
+            " GROUP BY contact_id",
+            (client_id, ids),
+        )
+        return {str(row.get("contact_id") or ""): int(row.get("orders") or 0)
+                for row in portal_db.rows(cur)}
+    except Exception:
+        return {}
+
+
 def _tags_map(cur, client_id, conversation_ids) -> dict:
     """Return {conversation_id: [tag, ...]} for the given conversations."""
     ids = [int(cid) for cid in conversation_ids if cid is not None]
@@ -171,6 +199,8 @@ def list_conversations():
     if unread_filter != "1":
         unread_filter = ""
     include_counts = (request.args.get("include") or "").strip().lower() == "counts"
+    include_raw = (request.args.get("include") or "").strip().lower()
+    include_vip = "vip" in include_raw.split(",")
     starred_filter = (request.args.get("starred") or "").strip()
     if starred_filter != "1":
         starred_filter = ""
@@ -288,6 +318,25 @@ def list_conversations():
         item["tags"] = tags_map.get(row.get("id"), [])
         conversations.append(item)
 
+    if include_vip:
+        vip_map = {}
+        try:
+            portal_db.ensure_tables()
+            conn = portal_db._conn()
+            try:
+                with conn.cursor() as cur:
+                    vip_map = _paid_order_counts(
+                        cur, principal["client_id"],
+                        [row.get("contact_id") for row in found])
+            finally:
+                conn.close()
+        except Exception:
+            vip_map = {}
+        for item in conversations:
+            orders = int(vip_map.get(str(item.get("contact_id") or ""), 0))
+            item["paid_orders"] = orders
+            item["vip"] = orders >= VIP_THRESHOLD
+
     counts = {"needs_reply": 0, "overdue": 0, "unassigned": 0, "unread": 0}
     if include_counts:
         counts_sql = (
@@ -391,6 +440,22 @@ def conversation_detail(conversation_id: int):
 
     conversation_public = _conversation_public(found[0])
     conversation_public["tags"] = detail_tags
+    vip_map = {}
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                vip_map = _paid_order_counts(
+                    cur, principal["client_id"],
+                    [found[0].get("contact_id")])
+        finally:
+            conn.close()
+    except Exception:
+        vip_map = {}
+    vip_orders = int(vip_map.get(str(found[0].get("contact_id") or ""), 0))
+    conversation_public["paid_orders"] = vip_orders
+    conversation_public["vip"] = vip_orders >= VIP_THRESHOLD
     return jsonify({
         "conversation": conversation_public,
         "messages": [_message_public(m) for m in reversed(msgs)],
