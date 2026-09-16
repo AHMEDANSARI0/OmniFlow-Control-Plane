@@ -1,13 +1,13 @@
 """
 OmniFlow Control Plane — CONNECTOR endpoints (WhatsApp connector bridge).
 
-These endpoints serve the connector that runs on the customer's own device
-(home laptop) — the WhatsApp session NEVER runs on the server. Auth:
-X-Omniflow-Key header = OMNIFLOW_SERVICE_KEY or OMNIFLOW_ADMIN_API_KEY
-(the same proven pattern used by the admin endpoints).
+Ye endpoints customer ke apne device (home laptop) par chalne wale connector
+ke liye hain — server par WhatsApp session KABHI nahi chalta. Auth:
+X-Omniflow-Key header = OMNIFLOW_SERVICE_KEY ya OMNIFLOW_ADMIN_API_KEY
+(wahi proven pattern jo admin endpoints use karte hain).
 
-The connector's tenant is resolved as follows (first match wins):
-  1. Explicit `client_id` in the request body/query
+Connector ka tenant resolve hota hai (pehla match jeeta):
+  1. Request body/query me explicit `client_id`
   2. Backend env OMNIFLOW_CONNECTOR_USER_EMAIL -> platform_users lookup
 
 Endpoints:
@@ -28,13 +28,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from flask import Blueprint, jsonify, request
-
-from intent_classifier import classify_intent
-import portal_followups
-import portal_kb
-import portal_revenue
-import portal_growth
-import portal_conversations
 
 import portal_db
 import portal_cod
@@ -123,8 +116,8 @@ def _tenant_or_error(explicit_client_id: Any):
         return None, (jsonify({"error": {
             "code": "connector_not_configured",
             "message": (
-                "Connector tenant could not be resolved: send client_id in the "
-                "body/query, or set OMNIFLOW_CONNECTOR_USER_EMAIL on the backend."
+                "Connector tenant resolve nahi hua: body/query me client_id bhejein "
+                "ya backend par OMNIFLOW_CONNECTOR_USER_EMAIL set karein."
             ),
         }}), 503)
     return tenant, None
@@ -154,7 +147,7 @@ def report_status():
     state = payload.get("state")
     if state not in ALLOWED_STATES:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "state must be disconnected, connecting, or connected."}}), 400
+                                  "message": "state disconnected|connecting|connected hon."}}), 400
     phone = payload.get("phone")
     phone = phone.strip() if isinstance(phone, str) else None
     account_name = payload.get("account_name")
@@ -195,6 +188,10 @@ def list_commands():
     if error:
         return error
     limit = _query_int("limit", 20, 1, 50)
+    channel = (args.get("channel") or "").strip()
+    if channel and channel not in ALLOWED_CHANNELS:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "channel whatsapp|telegram hon."}}), 400
 
     try:
         portal_db.ensure_tables()
@@ -223,13 +220,18 @@ def list_commands():
                     )
                 except Exception:
                     pass
-                cur.execute(
+                cmd_sql = (
                     "SELECT id, action, payload, created_at FROM "
                     + portal_db._q(portal_db.CMD_TABLE) +
                     " WHERE client_id = %s AND status = 'pending'"
-                    " ORDER BY id ASC LIMIT %s",
-                    (tenant["client_id"], limit),
                 )
+                cmd_params: list = [tenant["client_id"]]
+                if channel:
+                    cmd_sql += " AND channel = %s"
+                    cmd_params.append(channel)
+                cmd_sql += " ORDER BY id ASC LIMIT %s"
+                cmd_params.append(limit)
+                cur.execute(cmd_sql, tuple(cmd_params))
                 found = portal_db.rows(cur)
         finally:
             conn.close()
@@ -260,7 +262,7 @@ def ack_command():
     command_id = payload.get("command_id")
     if isinstance(command_id, bool) or not isinstance(command_id, int) or command_id <= 0:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "command_id (a positive int) is required."}}), 400
+                                  "message": "command_id (positive int) zaroori hai."}}), 400
     ok_flag = payload.get("ok") is True
     note = payload.get("note")
     note = note if isinstance(note, str) else None
@@ -285,7 +287,7 @@ def ack_command():
 
     if not updated:
         return jsonify({"error": {"code": "not_found",
-                                  "message": "Command not found."}}), 404
+                                  "message": "Command nahi mili."}}), 404
     return jsonify({"ok": True}), 200
 
 
@@ -303,7 +305,7 @@ def connector_bot_config():
                 cur.execute(
                     "SELECT agent_name, tone, greeting, fallback,"
                     " working_hours_enabled, working_hours_start, working_hours_end,"
-                    " human_handoff_enabled, custom_instructions, updated_at"
+                    " human_handoff_enabled, updated_at"
                     " FROM " + portal_db._q(portal_db.BOT_TABLE) +
                     " WHERE client_id = %s",
                     (tenant["client_id"],),
@@ -324,7 +326,6 @@ def connector_bot_config():
             "working_hours_start": "09:00",
             "working_hours_end": "18:00",
             "human_handoff_enabled": False,
-            "custom_instructions": "",
             "updated_at": None,
         }), 200
 
@@ -341,50 +342,13 @@ def connector_bot_config():
         "working_hours_start": row.get("working_hours_start") or "09:00",
         "working_hours_end": row.get("working_hours_end") or "18:00",
         "human_handoff_enabled": row.get("human_handoff_enabled") is True,
-        "custom_instructions": row.get("custom_instructions") or "",
         "updated_at": updated.isoformat() if isinstance(updated, datetime) else None,
     }), 200
 
 
-@bp.get("/profile")
-def connector_business_profile():
-    """Business profile mirror (read-only) for the laptop connector."""
-    tenant, error = _tenant_or_error(request.args.get("client_id"))
-    if error:
-        return error
-
-    try:
-        portal_db.ensure_tables()
-        conn = portal_db._conn()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT profile, updated_at FROM "
-                    + portal_db._q(portal_db.PROFILE_TABLE) +
-                    " WHERE client_id = %s",
-                    (tenant["client_id"],),
-                )
-                found = portal_db.rows(cur)
-        finally:
-            conn.close()
-    except Exception as error:
-        return jsonify(portal_db.portal_unavailable(error, "connector profile read")[0]), 503
-
-    profile = {}
-    updated_at = None
-    if found:
-        raw = found[0].get("profile")
-        if isinstance(raw, dict):
-            profile = raw
-        updated = found[0].get("updated_at")
-        if isinstance(updated, datetime):
-            updated_at = updated.isoformat()
-
-    return jsonify({"profile": profile, "updated_at": updated_at}), 200
-
-
 MAX_INGEST_MESSAGES = 100
 ALLOWED_DIRECTIONS = ("in", "out")
+ALLOWED_CHANNELS = ("whatsapp", "telegram")
 
 
 _AWAY_TABLE_READY = False
@@ -604,22 +568,22 @@ def ingest_whatsapp_messages():
     messages = payload.get("messages")
     if not isinstance(messages, list) or not messages:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "messages (a non-empty list) is required."}}), 400
+                                  "message": "messages (non-empty list) zaroori hai."}}), 400
     if len(messages) > MAX_INGEST_MESSAGES:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Send at most "
+                                  "message": "Aik request me max "
                                              + str(MAX_INGEST_MESSAGES)
-                                             + " messages per request."}}), 400
+                                             + " messages bhejein."}}), 400
 
     normalized = []
     for item in messages:
         if not isinstance(item, dict):
             return jsonify({"error": {"code": "bad_request",
-                                      "message": "Each message must be an object."}}), 400
+                                      "message": "Har message aik object ho."}}), 400
         sender = item.get("from")
         if not isinstance(sender, str) or not sender.strip():
             return jsonify({"error": {"code": "bad_request",
-                                      "message": "Each message requires a 'from' field."}}), 400
+                                      "message": "Har message me 'from' zaroori hai."}}), 400
         body = item.get("body")
         if body is None:
             body = ""
@@ -628,20 +592,19 @@ def ingest_whatsapp_messages():
         direction = item.get("direction", "in")
         if direction not in ALLOWED_DIRECTIONS:
             return jsonify({"error": {"code": "bad_request",
-                                      "message": "direction must be 'in' or 'out'."}}), 400
+                                      "message": "direction in|out hon."}}), 400
+        channel = item.get("channel", "whatsapp")
+        if channel not in ALLOWED_CHANNELS:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "channel whatsapp|telegram hon."}}), 400
         name = item.get("name")
         name = name.strip() if isinstance(name, str) else None
-        item_intent = (
-            classify_intent(body)
-            if direction == "in"
-            else None
-        )
         normalized.append({
             "from": sender.strip(),
             "body": body,
             "name": name,
             "direction": direction,
-            "intent": item_intent,
+            "channel": channel,
         })
 
     inserted = 0
@@ -655,120 +618,29 @@ def ingest_whatsapp_messages():
                         "INSERT INTO " + portal_db._q(portal_db.CONV_TABLE) +
                         " (client_id, channel, contact_id, contact_name,"
                         " status, last_message_preview, last_message_at,"
-                        " last_intent, created_at, updated_at) "
-                        "VALUES (%s, 'whatsapp', %s, %s, 'open', %s, NOW(), %s, NOW(), NOW()) "
+                        " created_at, updated_at) "
+                        "VALUES (%s, %s, %s, %s, 'open', %s, NOW(), NOW(), NOW()) "
                         "ON CONFLICT (client_id, channel, contact_id) DO UPDATE SET "
                         " contact_name = COALESCE(EXCLUDED.contact_name,"
                         " " + portal_db._q(portal_db.CONV_TABLE) + ".contact_name), "
                         " last_message_preview = EXCLUDED.last_message_preview, "
                         " last_message_at = EXCLUDED.last_message_at, "
-                        " last_intent = COALESCE(EXCLUDED.last_intent, "
-                        " " + portal_db._q(portal_db.CONV_TABLE) + ".last_intent), "
                         " updated_at = NOW() "
-                        "RETURNING id, (xmax = 0) AS is_new",
-                        (tenant["client_id"], item["from"], item["name"], item["body"],
-                         item["intent"]),
+                        "RETURNING id",
+                        (tenant["client_id"], item["channel"], item["from"],
+                         item["name"], item["body"]),
                     )
                     conv = portal_db.rows(cur)
                     conversation_id = conv[0]["id"] if conv else None
                     cur.execute(
                         "INSERT INTO " + portal_db._q(portal_db.MSGS_TABLE) +
                         " (conversation_id, client_id, direction, body,"
-                        " sender_name, status, intent, created_at) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())",
+                        " sender_name, status, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, NOW())",
                         (conversation_id, tenant["client_id"], item["direction"],
                          item["body"], item["name"],
-                         "received" if item["direction"] == "in" else "sent",
-                         item["intent"]),
+                         "received" if item["direction"] == "in" else "sent"),
                     )
-                    try:
-                        portal_followups.update_followup_state(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["name"],
-                            item["intent"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        portal_kb.maybe_auto_reply(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["name"],
-                            item["body"],
-                            item["intent"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        portal_growth.record_kb_gap(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["name"],
-                            item["body"],
-                            item["intent"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        portal_revenue.handle_inbound(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["name"],
-                            item["body"],
-                            item["intent"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        portal_growth.handle_inbound(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["name"],
-                            item["body"],
-                            item["intent"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        portal_conversations.apply_automation_rules(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["body"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    if conv and conv[0].get("is_new") and item.get("direction") == "in":
-                        try:
-                            portal_conversations.maybe_send_welcome(
-                                tenant["client_id"],
-                                conversation_id,
-                                item["from"],
-                                item["name"],
-                                conn,
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            portal_conversations.auto_assign_new_chat(
-                                tenant["client_id"],
-                                conversation_id,
-                                conn,
-                            )
-                        except Exception:
-                            pass
                     try:
                         _maybe_enqueue_away_reply(
                             tenant["client_id"],
@@ -800,6 +672,18 @@ def ingest_whatsapp_messages():
                         )
                     except Exception:
                         pass
+                    if item["direction"] == "in":
+                        try:
+                            import portal_compliance
+
+                            portal_compliance.maybe_opt_out(
+                                tenant["client_id"],
+                                item["from"],
+                                item["body"],
+                                conn,
+                            )
+                        except Exception:
+                            pass
                         try:
                             import portal_listen
 
@@ -854,12 +738,6 @@ def ingest_whatsapp_messages():
                     except Exception:
                         pass
                     inserted += 1
-            try:
-                portal_conversations.sweep_auto_close(
-                    tenant["client_id"], conn,
-                )
-            except Exception:
-                pass
             conn.commit()
         finally:
             conn.close()
