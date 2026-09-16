@@ -20,6 +20,35 @@ logger = logging.getLogger(__name__)
 WINDOW_DAYS = 7
 MONTH_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
 
+INTENT_RULES = (
+    ("refund", re.compile(r"refund|money back|paisa wapas|wapsi|return kar|cancel kar", re.I)),
+    ("order_status", re.compile(r"order|parcel|shipment|tracking|kahan|kahaan|kab aay|kab mile|deliver", re.I)),
+    ("complaint", re.compile(r"complaint|shikayat|ghatiya|bewakoof|fraud|scam|hangama|kharab|report kar", re.I)),
+    ("pricing", re.compile(r"price|rate|kitna|qimat|cost|discount|sale", re.I)),
+    ("delivery", re.compile(r"delivery|shipping|charger|courier|tcs|post", re.I)),
+    ("greeting", re.compile(r"^(hi|hello|hey|salam|assalam)\b", re.I)),
+)
+PHONE_RE = re.compile(r"(\+?92|0)?[\s-]?3\d{2}[\s-]?\d{7}\b")
+ORDER_RE = re.compile(r"#(\d{3,})")
+EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def classify_intent(text: str) -> str:
+    value = str(text or "")
+    for intent, pattern in INTENT_RULES:
+        if pattern.search(value):
+            return intent
+    return "other"
+
+
+def extract_entities(text: str) -> dict:
+    value = str(text or "")
+    return {
+        "phones": [match.group(0).strip() for match in PHONE_RE.finditer(value)][:5],
+        "order_ids": [match.group(1) for match in ORDER_RE.finditer(value)][:5],
+        "emails": [match.group(0) for match in EMAIL_RE.finditer(value)][:5],
+    }
+
 
 def _principal_or_error():
     try:
@@ -48,6 +77,19 @@ def _day_key(when: Any) -> str:
         return when.strftime("%Y-%m-%d")
     except AttributeError:
         return ""
+
+
+@bp.get("/insights/intent")
+def intent_endpoint():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    text = (request.args.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "text is required."}}), 400
+    return jsonify({"intent": classify_intent(text[:1000]),
+                    "entities": extract_entities(text[:1000])}), 200
 
 
 @bp.get("/insights/weekly")

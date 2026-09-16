@@ -851,9 +851,53 @@ def record_kb_gap(client_id, conversation_id, contact_id, contact_name,
         cur.execute(
             "INSERT INTO " + portal_db._q(GAPS_TABLE) +
             " (client_id, conversation_id, question, intent)"
-            " VALUES (%s, %s, %s, %s)",
-            (client_id, conversation_id, question, str(intent or "general")),
+            " VALUES (%s, %s, %s, %s)"
+            " RETURNING (SELECT COUNT(*) FROM " + portal_db._q(GAPS_TABLE) +
+            " g WHERE g.conversation_id = %s AND g.client_id = %s) AS total",
+            (client_id, conversation_id, question, str(intent or "general"),
+             conversation_id, client_id),
         )
+        inserted = portal_db.rows(cur)
+        if inserted and int(inserted[0].get("total") or 0) >= 2:
+            _escalate_conversation(cur, client_id, conversation_id,
+                                   "repeated knowledge gaps")
+
+
+def _escalate_conversation(cur, client_id, conversation_id, reason: str) -> None:
+    """Assign the conversation to the first team member and audit it, so a
+    lost bot hands the chat to a human automatically. Never raises."""
+    import portal_db as _db
+    try:
+        cur.execute(
+            "SELECT to_regclass(%s)", ("portal_team_members",),
+        )
+        found = _db.rows(cur)
+        if found and found[0].get("to_regclass"):
+            cur.execute(
+                "SELECT user_id FROM " + _db._q(_db.TEAM_TABLE) +
+                " WHERE client_id = %s AND user_id IS NOT NULL"
+                " ORDER BY user_id LIMIT 1",
+                (client_id,),
+            )
+            members = _db.rows(cur)
+            if members and members[0].get("user_id") is not None:
+                cur.execute(
+                    "UPDATE " + _db._q(_db.CONV_TABLE) +
+                    " SET assigned_to = %s"
+                    " WHERE id = %s AND client_id = %s",
+                    (members[0].get("user_id"), conversation_id, client_id),
+                )
+        _db.log_action(
+            cur,
+            client_id,
+            "bot.escalated",
+            "bot",
+            None,
+            conversation_id,
+            ("Bot handed off: " + str(reason))[:200],
+        )
+    except Exception:
+        pass
 
 
 def handle_inbound(client_id, conversation_id, contact_id, contact_name,

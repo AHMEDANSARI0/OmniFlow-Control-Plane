@@ -2001,6 +2001,40 @@ def customer_profile():
                     (principal["client_id"], principal["client_id"], contact),
                 )
                 notes = portal_db.rows(cur)
+                if _profile_table_exists(cur, "portal_contact_lang"):
+                    cur.execute(
+                        "SELECT lang FROM " + portal_db._q("portal_contact_lang") +
+                        " WHERE client_id = %s AND contact_id = %s",
+                        (principal["client_id"], contact),
+                    )
+                    lang_rows = portal_db.rows(cur)
+                else:
+                    lang_rows = []
+                if _profile_table_exists(cur, "portal_contact_identities"):
+                    cur.execute(
+                        "SELECT DISTINCT contact_id FROM "
+                        + portal_db._q("portal_contact_identities") +
+                        " WHERE client_id = %s AND identity_key IN"
+                        " (SELECT identity_key FROM "
+                        + portal_db._q("portal_contact_identities") +
+                        " WHERE client_id = %s AND contact_id = %s)"
+                        " ORDER BY contact_id",
+                        (principal["client_id"], principal["client_id"], contact),
+                    )
+                    identity_rows = portal_db.rows(cur)
+                else:
+                    identity_rows = []
+                if _profile_table_exists(cur, "portal_action_requests"):
+                    cur.execute(
+                        "SELECT id, kind, status, note, created_at FROM "
+                        + portal_db._q("portal_action_requests") +
+                        " WHERE client_id = %s AND contact_id = %s"
+                        " ORDER BY id DESC LIMIT 5",
+                        (principal["client_id"], contact),
+                    )
+                    action_rows = portal_db.rows(cur)
+                else:
+                    action_rows = []
         finally:
             conn.close()
     except Exception as error:
@@ -2054,6 +2088,23 @@ def customer_profile():
                 "created_at": _iso(row.get("created_at")),
             }
             for row in notes
+        ],
+        "language": (lang_rows[0].get("lang") if lang_rows else None),
+        "linked_channels": [
+            str(row.get("contact_id") or "")
+            for row in identity_rows
+            if str(row.get("contact_id") or "")
+            and str(row.get("contact_id") or "") != contact
+        ],
+        "actions": [
+            {
+                "id": row.get("id"),
+                "kind": row.get("kind"),
+                "status": row.get("status"),
+                "note": str(row.get("note") or ""),
+                "created_at": _iso(row.get("created_at")),
+            }
+            for row in action_rows
         ],
     }), 200
 

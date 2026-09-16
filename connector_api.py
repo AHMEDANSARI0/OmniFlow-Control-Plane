@@ -38,6 +38,7 @@ import portal_conversations
 
 import portal_db
 import portal_cod
+import portal_contacts
 import portal_sequences
 
 
@@ -786,6 +787,15 @@ def ingest_whatsapp_messages():
                             item["name"],
                             item["body"],
                             item["direction"],
+                            conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        portal_contacts.maybe_detect_language(
+                            tenant["client_id"],
+                            item["from"],
+                            item["body"],
                             conn,
                         )
                     except Exception:
