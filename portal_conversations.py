@@ -2020,6 +2020,7 @@ def conversation_assist(conversation_id: int):
               and str(row.get("contact_id") or "") != contact]
     return jsonify({
         "intent": portal_insights.classify_intent(text[:1000]),
+        "sentiment": portal_insights.analyze_sentiment(text[:1000]),
         "language": language,
         "linked": linked,
         "suggestions": suggestions,

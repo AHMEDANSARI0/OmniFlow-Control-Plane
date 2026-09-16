@@ -800,6 +800,30 @@ def ingest_whatsapp_messages():
                         )
                     except Exception:
                         pass
+                        try:
+                            import portal_listen
+
+                            portal_listen.maybe_listen(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["body"],
+                                conn,
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            import portal_routing
+
+                            portal_routing.maybe_route(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["body"],
+                                conn,
+                            )
+                        except Exception:
+                            pass
                     try:
                         portal_sequences.maybe_enroll_new_contact(
                             tenant["client_id"],

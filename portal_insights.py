@@ -33,6 +33,45 @@ ORDER_RE = re.compile(r"#(\d{3,})")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
+POSITIVE_WORDS = (
+    "acha", "ache", "theek", "shukriya", "zabardast", "behtareen",
+    "thanks", "thank", "great", "good", "love", "perfect", "nice",
+    "helpful", "fast", "best", "maza", "kamal",
+)
+NEGATIVE_WORDS = (
+    "ghatiya", "bewakoof", "kharab", "fraud", "scam", "shikayat",
+    "complain", "complaint", "late", "der", "worst", "bad", "rude",
+    "problem", "masla", "issue", "hangama", "paisa wapas", "refund",
+    "pathar", "nakli", "cheap",
+)
+
+
+def analyze_sentiment(text: str) -> dict:
+    """Deterministic lexicon sentiment (English + Roman Urdu). No AI."""
+    value = " " + re.sub(r"[^\w\s]", " ", str(text or "").lower()) + " "
+    positive = sorted({w for w in POSITIVE_WORDS if " " + w + " " in value
+                       or (" " in w and w in value)})
+    negative = sorted({w for w in NEGATIVE_WORDS if " " + w + " " in value
+                       or (" " in w and w in value)})
+    score = len(positive) - len(negative)
+    if positive and not negative:
+        label = "positive"
+    elif negative and not positive:
+        label = "negative"
+    elif negative and positive and len(negative) > len(positive):
+        label = "negative"
+    elif positive and negative:
+        label = "mixed"
+    else:
+        label = "neutral"
+    return {
+        "label": label,
+        "score": score,
+        "positive": positive[:5],
+        "negative": negative[:5],
+    }
+
+
 def classify_intent(text: str) -> str:
     value = str(text or "")
     for intent, pattern in INTENT_RULES:
@@ -77,6 +116,171 @@ def _day_key(when: Any) -> str:
         return when.strftime("%Y-%m-%d")
     except AttributeError:
         return ""
+
+
+@bp.get("/insights/sentiment")
+def sentiment_endpoint():
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    text = (request.args.get("text") or "").strip()
+    if not text:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "text is required."}}), 400
+    return jsonify(analyze_sentiment(text[:2000])), 200
+
+
+@bp.get("/insights/churn")
+def churn_risk():
+    """Contacts gone quiet: no activity for N days (default 14)."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        days = int(request.args.get("days") or 14)
+    except ValueError:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "days must be a number."}}), 400
+    if not 1 <= days <= 180:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "days must be 1-180."}}), 400
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT contact_id, MAX(COALESCE(contact_name, '')) AS name,"
+                    " COUNT(*) AS chats, MAX(last_message_at) AS last_at"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s"
+                    " GROUP BY contact_id"
+                    " HAVING MAX(last_message_at) < NOW() - make_interval(days => %s)"
+                    " ORDER BY MAX(last_message_at) ASC LIMIT 50",
+                    (client_id, days),
+                )
+                rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("churn read failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(error, "churn read")[0]), 503
+    return jsonify({"days": days, "contacts": [
+        {
+            "contact_id": row.get("contact_id"),
+            "name": str(row.get("name") or ""),
+            "chats": int(row.get("chats") or 0),
+            "last_at": _day_key(row.get("last_at")) or None,
+        }
+        for row in rows
+    ]}), 200
+
+
+@bp.get("/insights/staffing")
+def staffing_forecast():
+    """Inbound chats by hour of day (last 28 days) plus peak suggestions."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT EXTRACT(HOUR FROM m.created_at) AS hour,"
+                    " COUNT(*) AS total"
+                    " FROM " + portal_db._q(portal_db.MSGS_TABLE) + " m"
+                    " JOIN " + portal_db._q(portal_db.CONV_TABLE) + " c"
+                    " ON c.id = m.conversation_id"
+                    " WHERE c.client_id = %s AND m.direction = 'in'"
+                    " AND m.created_at >= NOW() - INTERVAL '28 days'"
+                    " GROUP BY 1 ORDER BY 1",
+                    (client_id,),
+                )
+                rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("staffing read failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(error, "staffing read")[0]), 503
+    hour_map = {int(row.get("hour") or 0): int(row.get("total") or 0)
+                for row in rows}
+    hours = [{"hour": h, "chats": hour_map.get(h, 0)} for h in range(24)]
+    peak_chats = max((entry["chats"] for entry in hours), default=0)
+    threshold = peak_chats * 0.6
+    suggested = [entry["hour"] for entry in hours if entry["chats"] >= threshold
+                 and entry["chats"] > 0]
+    peak_hour = None
+    if peak_chats > 0:
+        peak_hour = max(hours, key=lambda entry: entry["chats"])["hour"]
+    return jsonify({
+        "hours": hours,
+        "peak_hour": peak_hour,
+        "peak_chats": peak_chats,
+        "suggested": suggested,
+    }), 200
+
+
+@bp.get("/insights/broadcast-suggestions")
+def broadcast_suggestions():
+    """Deterministic audience ideas from existing workspace data."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    client_id = principal["client_id"]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COUNT(*) FILTER (WHERE lead_temp = 'hot') AS hot,"
+                    " COUNT(*) FILTER (WHERE status = 'open') AS open_chats,"
+                    " COUNT(*) AS total"
+                    " FROM " + portal_db._q(portal_db.CONV_TABLE) +
+                    " WHERE client_id = %s",
+                    (client_id,),
+                )
+                conv_rows = portal_db.rows(cur)
+                stale = 0
+                optouts = 0
+                if _table_exists(cur, "portal_optouts"):
+                    cur.execute(
+                        "SELECT COUNT(*) AS total FROM " +
+                        portal_db._q("portal_optouts") + " WHERE client_id = %s",
+                        (client_id,),
+                    )
+                    optout_rows = portal_db.rows(cur)
+                    optouts = int((optout_rows[0] if optout_rows else {})
+                                  .get("total") or 0)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("suggestions read failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(error, "suggestions read")[0]), 503
+    stats = conv_rows[0] if conv_rows else {}
+    hot = int(stats.get("hot") or 0)
+    total = int(stats.get("total") or 0)
+    open_chats = int(stats.get("open_chats") or 0)
+    stale = max(total - open_chats, 0)
+    suggestions = [
+        {"audience": "hot", "count": hot,
+         "note": "Hot leads - highest conversion, keep the COD confirm flow on."},
+        {"audience": "stale", "count": stale,
+         "note": "Closed or idle chats - win-back broadcast candidates."},
+        {"audience": "all", "count": max(total - optouts, 0),
+         "note": "Everyone reachable (opted-out contacts excluded automatically)."},
+    ]
+    return jsonify({"suggestions": suggestions}), 200
+
+
+def _table_exists(cur, table: str) -> bool:
+    cur.execute("SELECT to_regclass(%s) AS oid", (table,))
+    rows = portal_db.rows(cur)
+    return bool(rows and rows[0].get("oid"))
 
 
 @bp.get("/insights/intent")
