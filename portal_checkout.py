@@ -7,6 +7,7 @@ import csv
 import io
 import json
 import logging
+import datetime
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -113,6 +114,13 @@ def _ensure_checkout_tables(conn) -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS portal_checkout_links_client_idx ON "
             + portal_db._q(LINKS_TABLE) + " (client_id, id DESC)"
+        )
+        cur.execute(
+            "ALTER TABLE " + portal_db._q(LINKS_TABLE) +
+            " ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ,"
+            " ADD COLUMN IF NOT EXISTS view_count INTEGER NOT NULL DEFAULT 0,"
+            " ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12,2)"
+            " NOT NULL DEFAULT 0"
         )
     conn.commit()
     _CHECKOUT_DDL_READY = True
@@ -397,6 +405,14 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "total": float(row.get("total") or 0),
         "status": row.get("status") or "open",
         "created_at": _iso(row.get("created_at")),
+        "expires_at": _iso(row.get("expires_at")),
+        "view_count": int(row.get("view_count") or 0),
+        "paid_amount": round(float(row.get("paid_amount") or 0), 2),
+        "due": max(
+            round(float(row.get("total") or 0)
+                  - float(row.get("paid_amount") or 0), 2),
+            0.0,
+        ),
     }
 
 
@@ -419,6 +435,18 @@ def create_checkout_link():
         return jsonify({"error": {"code": "bad_request",
                                   "message": "contact_id is required."}}), 400
     total = round(sum(item["qty"] * item["price"] for item in items), 2)
+    expires_days = payload.get("expires_in_days")
+    if expires_days is not None:
+        try:
+            expires_days = int(expires_days)
+        except (TypeError, ValueError):
+            expires_days = -1
+        if not 1 <= expires_days <= 60:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "Expiry must be between"
+                                                 " 1 and 60 days."}}), 400
+    else:
+        expires_days = None
     token = secrets.token_urlsafe(16)
     try:
         portal_db.ensure_tables()
@@ -428,12 +456,15 @@ def create_checkout_link():
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO " + portal_db._q(LINKS_TABLE) +
-                    " (client_id, contact_id, token, title, items, total)"
-                    " VALUES (%s, %s, %s, %s, CAST(%s AS JSONB), %s)"
+                    " (client_id, contact_id, token, title, items, total,"
+                    " expires_at)"
+                    " VALUES (%s, %s, %s, %s, CAST(%s AS JSONB), %s,"
+                    " CASE WHEN %s IS NULL THEN NULL"
+                    " ELSE NOW() + (%s * INTERVAL '1 day') END)"
                     " RETURNING id, token, contact_id, title, items, total,"
-                    " status, created_at",
+                    " status, created_at, expires_at, view_count",
                     (principal["client_id"], contact, token, title,
-                     json.dumps(items), total),
+                     json.dumps(items), total, expires_days, expires_days),
                 )
                 created = portal_db.rows(cur)
                 portal_db.log_action(
@@ -467,7 +498,8 @@ def list_checkout_links():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
-                    " status, created_at FROM " + portal_db._q(LINKS_TABLE) +
+                    " status, created_at, expires_at, view_count FROM "
+                    + portal_db._q(LINKS_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT 30",
                     (principal["client_id"],),
                 )
@@ -587,6 +619,217 @@ def update_checkout_link(link_id: int):
         return jsonify(portal_db.portal_unavailable(error, "checkout update")[0]), 503
     return jsonify({"ok": True, "status": status,
                     "notified": bool(notified)}), 200
+
+
+@bp.patch("/checkout/links/<int:link_id>/edit")
+def edit_checkout_link(link_id: int):
+    """Edit title/items of an OPEN checkout link (totals recomputed).
+    Paid/shipped/delivered/cancelled links are history - never editable."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    title = str(payload.get("title") or "").strip()[:MAX_TITLE]
+    items, err = _normalize_items(payload.get("items"))
+    if err:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": err}}), 400
+    if not items:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "At least one item is"
+                                             " required."}}), 400
+    total = round(sum(item["qty"] * item["price"] for item in items), 2)
+    expires_days = payload.get("expires_in_days")
+    if expires_days is not None:
+        try:
+            expires_days = int(expires_days)
+        except (TypeError, ValueError):
+            expires_days = -1
+        if not 0 <= expires_days <= 60:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "Expiry must be 0 (never)"
+                                                 " or 1-60 days."}}), 400
+    else:
+        expires_days = None
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_checkout_tables(conn)
+            with conn.cursor() as cur:
+                set_sql = (
+                    "UPDATE " + portal_db._q(LINKS_TABLE) +
+                    " SET title = %s, items = CAST(%s AS JSONB),"
+                    " total = %s, updated_at = NOW()"
+                )
+                params = [title, json.dumps(items), total]
+                if expires_days is not None:
+                    if expires_days == 0:
+                        set_sql += ", expires_at = NULL"
+                    else:
+                        set_sql += (", expires_at = NOW() +"
+                                    " (%s * INTERVAL '1 day')")
+                        params.append(expires_days)
+                set_sql += (" WHERE id = %s AND client_id = %s"
+                            " AND status = 'open' RETURNING id")
+                params.extend([link_id, principal["client_id"]])
+                cur.execute(set_sql, tuple(params))
+                updated = portal_db.rows(cur)
+                if not updated:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Only open links"
+                                                         " can be"
+                                                         " edited."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "checkout.edited",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Checkout link " + str(link_id) + " edited ("
+                     + str(total) + ")")[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("checkout edit failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(error, "checkout edit")[0]), 503
+    return jsonify({"ok": True, "total": total}), 200
+
+
+@bp.post("/checkout/links/<int:link_id>/duplicate")
+def duplicate_checkout_link(link_id: int):
+    """Duplicate any checkout link into a NEW open link (re-orders)."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_checkout_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT contact_id, title, items, total FROM "
+                    + portal_db._q(LINKS_TABLE) +
+                    " WHERE id = %s AND client_id = %s",
+                    (link_id, principal["client_id"]),
+                )
+                found = portal_db.rows(cur)
+                if not found:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Link not"
+                                                         " found."}}), 404
+                source = found[0]
+                token = secrets.token_urlsafe(16)
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(LINKS_TABLE) +
+                    " (client_id, contact_id, token, title, items, total)"
+                    " VALUES (%s, %s, %s, %s, %s, %s)"
+                    " RETURNING id, token, contact_id, title, items, total,"
+                    " status, created_at",
+                    (principal["client_id"], source.get("contact_id"),
+                     token, source.get("title"), source.get("items"),
+                     source.get("total")),
+                )
+                created = portal_db.rows(cur)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "checkout.duplicated",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Checkout link " + str(link_id) + " duplicated -> "
+                     + str((created[0] or {}).get("token"))[:8])[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("checkout duplicate failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "checkout duplicate")[0]), 503
+    return jsonify({"ok": True,
+                    "link": _public(created[0] if created else {})}), 200
+
+
+@bp.post("/checkout/links/<int:link_id>/advance")
+def add_checkout_advance(link_id: int):
+    """Record an advance (partial payment) on an OPEN checkout link.
+    The link flips to paid once the advance covers the total."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    try:
+        amount = round(float(payload.get("amount")), 2)
+    except (TypeError, ValueError):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enter a valid amount."}}), 400
+    if amount <= 0:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enter an amount greater"
+                                             " than zero."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_checkout_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(LINKS_TABLE) +
+                    " SET paid_amount = COALESCE(paid_amount, 0) + %s,"
+                    " status = CASE WHEN COALESCE(paid_amount, 0) + %s"
+                    " >= total THEN 'paid' ELSE status END,"
+                    " updated_at = NOW()"
+                    " WHERE id = %s AND client_id = %s AND status = 'open'"
+                    " RETURNING paid_amount, total, status",
+                    (amount, amount, link_id, principal["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+                if not updated:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Only open links"
+                                                         " can take an"
+                                                         " advance."}}), 404
+                new_paid = round(float(updated[0].get("paid_amount") or 0), 2)
+                new_total = round(float(updated[0].get("total") or 0), 2)
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "checkout.advance",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Advance " + str(amount) + " on link "
+                     + str(link_id) + " (paid " + str(new_paid) + "/"
+                     + str(new_total) + ")"
+                     + (" FULLY PAID"
+                        if new_paid >= new_total else ""))[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("checkout advance failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "checkout advance")[0]), 503
+    new_status = updated[0].get("status") or "open"
+    return jsonify({"ok": True, "paid_amount": new_paid,
+                    "due": max(round(new_total - new_paid, 2), 0.0),
+                    "status": new_status}), 200
 
 
 @bp.get("/checkout/settings")
@@ -772,11 +1015,21 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
-                    " status, created_at FROM " + portal_db._q(LINKS_TABLE) +
+                    " status, created_at, expires_at, view_count FROM "
+                    + portal_db._q(LINKS_TABLE) +
                     " WHERE token = %s LIMIT 1",
                     (token,),
                 )
                 rows = portal_db.rows(cur)
+                if rows and (rows[0].get("status")
+                             or "open") == "open":
+                    cur.execute(
+                        "UPDATE " + portal_db._q(LINKS_TABLE) +
+                        " SET view_count = COALESCE(view_count, 0) + 1"
+                        " WHERE token = %s",
+                        (token,),
+                    )
+                    conn.commit()
         finally:
             conn.close()
     except Exception as error:
@@ -786,7 +1039,19 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
     if not rows:
         return {"error": {"code": "not_found",
                           "message": "This order link is not valid."}}, 404
-    view = _public(rows[0])
+    row = rows[0]
+    expires_at = row.get("expires_at")
+    if (row.get("status") or "open") == "open" and expires_at is not None:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        try:
+            expired = expires_at < now
+        except TypeError:
+            expired = str(expires_at) < now.isoformat()
+        if expired:
+            return {"error": {"code": "not_found",
+                              "message": "This order link has"
+                                         " expired."}}, 404
+    view = _public(row)
     view.pop("contact_id", None)
     view.pop("id", None)
     return view, 200
