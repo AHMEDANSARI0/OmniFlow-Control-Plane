@@ -3,12 +3,14 @@ a customer. Tokenized public view (no auth), server-computed totals,
 merchant-marked statuses. No payments provider — the link closes the loop
 over chat."""
 
+import csv
+import io
 import json
 import logging
 import secrets
 from typing import Any, Dict, List, Optional, Tuple
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, Response
 
 from portal_auth import (
     PortalAuthUnavailable,
@@ -32,9 +34,13 @@ logger = logging.getLogger(__name__)
 
 LINKS_TABLE = "portal_checkout_links"
 
-STATUSES = ("open", "paid", "cancelled", "shipped", "delivered")
+STATUSES = ("open", "paid", "cancelled", "shipped", "delivered", "returned")
 SETTINGS_TABLE = "portal_checkout_settings"
-NOTIFY_STATUSES = ("paid", "shipped", "delivered")
+RETURN_REASONS = ("size", "fit", "damaged", "late", "changed_mind", "other")
+RETURNS_TABLE = "portal_return_requests"
+_RETURNS_DDL_READY = False
+SETTINGS_TABLE = "portal_checkout_settings"
+NOTIFY_STATUSES = ("paid", "shipped", "delivered", "returned")
 DEFAULT_TEMPLATES = {
     "paid": "Payment received for '{title}'. Thank you! Your order is"
             " being prepared.",
@@ -42,6 +48,8 @@ DEFAULT_TEMPLATES = {
                " its way.",
     "delivered": "Your order '{title}' has been delivered. Thank you for"
                  " shopping with us!",
+    "returned": "Your return for '{title}' has been registered. Our team"
+                " will contact you shortly about the refund.",
 }
 _SETTINGS_DDL_READY = False
 CART_TABLE = "portal_cart_reminders"
@@ -132,6 +140,7 @@ def _ensure_settings_table(conn) -> None:
             "cart_tpl_1 TEXT NOT NULL DEFAULT ''",
             "cart_tpl_2 TEXT NOT NULL DEFAULT ''",
             "cart_tpl_3 TEXT NOT NULL DEFAULT ''",
+            "tpl_returned TEXT NOT NULL DEFAULT ''",
         ):
             cur.execute(
                 "ALTER TABLE " + portal_db._q(SETTINGS_TABLE) +
@@ -146,8 +155,8 @@ def _load_settings(cur, client_id):
     defaults (enabled, blank templates)."""
     try:
         cur.execute(
-            "SELECT notify_enabled, tpl_paid, tpl_shipped, tpl_delivered"
-            " FROM " + portal_db._q(SETTINGS_TABLE) +
+            "SELECT notify_enabled, tpl_paid, tpl_shipped, tpl_delivered,"
+            " tpl_returned FROM " + portal_db._q(SETTINGS_TABLE) +
             " WHERE client_id = %s",
             (client_id,),
         )
@@ -156,7 +165,7 @@ def _load_settings(cur, client_id):
         rows = []
     row = rows[0] if rows else {}
     settings = {"notify_enabled": bool(row.get("notify_enabled", True))}
-    for key in ("paid", "shipped", "delivered"):
+    for key in ("paid", "shipped", "delivered", "returned"):
         settings["tpl_" + key] = str(row.get("tpl_" + key) or "").strip()[:500]
     return settings
 
@@ -320,6 +329,30 @@ def materialize_cart_reminders(cur, client_id, conn) -> int:
     return sent
 
 
+def _ensure_returns_table(conn) -> None:
+    global _RETURNS_DDL_READY
+    if _RETURNS_DDL_READY:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS " + portal_db._q(RETURNS_TABLE) +
+            " (id BIGSERIAL PRIMARY KEY,"
+            " client_id BIGINT NOT NULL,"
+            " link_id BIGINT NOT NULL,"
+            " contact_id TEXT NOT NULL,"
+            " reason TEXT NOT NULL DEFAULT 'other',"
+            " note TEXT NOT NULL DEFAULT '',"
+            " created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),"
+            " UNIQUE (client_id, link_id))"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS portal_return_requests_client_idx ON "
+            + portal_db._q(RETURNS_TABLE) + " (client_id, id DESC)"
+        )
+    conn.commit()
+    _RETURNS_DDL_READY = True
+
+
 def _normalize_items(raw: Any) -> Tuple[Optional[List[Dict[str, Any]]], Optional[str]]:
     """Returns (items, error)."""
     if not isinstance(raw, list) or not raw:
@@ -460,7 +493,16 @@ def update_checkout_link(link_id: int):
     if status not in STATUSES:
         return jsonify({"error": {"code": "bad_request",
                                   "message": "Pick open, paid, cancelled,"
-                                             " shipped or delivered."}}), 400
+                                             " shipped, delivered or"
+                                             " returned."}}), 400
+    return_reason = str(payload.get("reason") or "").strip()
+    return_note = str(payload.get("note") or "").strip()[:300]
+    if status == "returned" and return_reason not in RETURN_REASONS:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Pick a return reason"
+                                             " (size, fit, damaged, late,"
+                                             " changed_mind or"
+                                             " other)."}}), 400
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
@@ -489,6 +531,23 @@ def update_checkout_link(link_id: int):
                     ("Checkout " + str(updated[0].get("token"))[:8]
                      + " -> " + str(status))[:200],
                 )
+                if status == "returned":
+                    try:
+                        _ensure_returns_table(conn)
+                        cur.execute(
+                            "INSERT INTO " + portal_db._q(RETURNS_TABLE) +
+                            " (client_id, link_id, contact_id, reason, note)"
+                            " VALUES (%s, %s, %s, %s, %s)"
+                            " ON CONFLICT (client_id, link_id) DO UPDATE"
+                            " SET reason = EXCLUDED.reason,"
+                            " note = EXCLUDED.note, created_at = NOW()",
+                            (principal["client_id"], link_id,
+                             updated[0].get("contact_id"), return_reason,
+                             return_note),
+                        )
+                    except Exception as return_error:
+                        logger.warning(
+                            "return record failed: %s", return_error)
                 notified = False
                 if status in NOTIFY_STATUSES:
                     try:
@@ -543,8 +602,9 @@ def get_checkout_settings():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT notify_enabled, tpl_paid, tpl_shipped,"
-                    " tpl_delivered, cart_enabled, cart_gap_1, cart_gap_2,"
-                    " cart_gap_3, cart_tpl_1, cart_tpl_2, cart_tpl_3 FROM "
+                    " tpl_delivered, tpl_returned, cart_enabled,"
+                    " cart_gap_1, cart_gap_2, cart_gap_3, cart_tpl_1,"
+                    " cart_tpl_2, cart_tpl_3 FROM "
                     + portal_db._q(SETTINGS_TABLE) +
                     " WHERE client_id = %s",
                     (principal["client_id"],),
@@ -581,6 +641,7 @@ def get_checkout_settings():
             "tpl_paid": str(row.get("tpl_paid") or "").strip()[:500],
             "tpl_shipped": str(row.get("tpl_shipped") or "").strip()[:500],
             "tpl_delivered": str(row.get("tpl_delivered") or "").strip()[:500],
+            "tpl_returned": str(row.get("tpl_returned") or "").strip()[:500],
             "cart": cart if rows else {
                 "enabled": False,
                 "gap_1": CART_GAP_DEFAULTS[1],
@@ -609,7 +670,7 @@ def save_checkout_settings():
                                   "message": "notify_enabled must be true"
                                              " or false."}}), 400
     templates = {}
-    for key in ("paid", "shipped", "delivered"):
+    for key in ("paid", "shipped", "delivered", "returned"):
         value = str(settings_in.get("tpl_" + key) or "").strip()
         if len(value) > 500:
             return jsonify({"error": {"code": "bad_request",
@@ -651,16 +712,17 @@ def save_checkout_settings():
                 cur.execute(
                     "INSERT INTO " + portal_db._q(SETTINGS_TABLE) +
                     " (client_id, notify_enabled, tpl_paid, tpl_shipped,"
-                    " tpl_delivered, cart_enabled, cart_gap_1, cart_gap_2,"
-                    " cart_gap_3, cart_tpl_1, cart_tpl_2, cart_tpl_3,"
-                    " updated_at)"
+                    " tpl_delivered, tpl_returned, cart_enabled,"
+                    " cart_gap_1, cart_gap_2, cart_gap_3, cart_tpl_1,"
+                    " cart_tpl_2, cart_tpl_3, updated_at)"
                     " VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,"
-                    " %s, NOW())"
+                    " %s, %s, NOW())"
                     " ON CONFLICT (client_id) DO UPDATE SET"
                     " notify_enabled = EXCLUDED.notify_enabled,"
                     " tpl_paid = EXCLUDED.tpl_paid,"
                     " tpl_shipped = EXCLUDED.tpl_shipped,"
                     " tpl_delivered = EXCLUDED.tpl_delivered,"
+                    " tpl_returned = EXCLUDED.tpl_returned,"
                     " cart_enabled = EXCLUDED.cart_enabled,"
                     " cart_gap_1 = EXCLUDED.cart_gap_1,"
                     " cart_gap_2 = EXCLUDED.cart_gap_2,"
@@ -671,7 +733,8 @@ def save_checkout_settings():
                     " updated_at = NOW()",
                     (principal["client_id"], notify_enabled,
                      templates["paid"], templates["shipped"],
-                     templates["delivered"], cart_enabled,
+                     templates["delivered"], templates["returned"],
+                     cart_enabled,
                      gaps[1], gaps[2], gaps[3],
                      cart_templates[1], cart_templates[2],
                      cart_templates[3]),
@@ -727,3 +790,107 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
     view.pop("contact_id", None)
     view.pop("id", None)
     return view, 200
+
+
+@bp.get("/checkout/returns")
+def list_checkout_returns():
+    """Recent returns (newest first, 50) with the linked order summary."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_returns_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT r.id, r.link_id, r.reason, r.note, r.created_at,"
+                    " l.title, l.total FROM " + portal_db._q(RETURNS_TABLE) +
+                    " r LEFT JOIN " + portal_db._q(LINKS_TABLE) +
+                    " l ON l.id = r.link_id AND l.client_id = r.client_id"
+                    " WHERE r.client_id = %s"
+                    " ORDER BY r.id DESC LIMIT 50",
+                    (principal["client_id"],),
+                )
+                rows = portal_db.rows(cur)
+                cur.execute(
+                    "SELECT COUNT(*) AS total FROM "
+                    + portal_db._q(RETURNS_TABLE) +
+                    " WHERE client_id = %s",
+                    (principal["client_id"],),
+                )
+                count_rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("returns read failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(error, "returns read")[0]), 503
+    items = []
+    for row in rows:
+        item = {
+            "id": int(row.get("id") or 0),
+            "link_id": int(row.get("link_id") or 0),
+            "reason": str(row.get("reason") or "other"),
+            "note": str(row.get("note") or ""),
+            "created_at": _iso(row.get("created_at")),
+            "title": str(row.get("title") or ""),
+            "total": float(row.get("total") or 0),
+        }
+        items.append(item)
+    total = 0
+    if count_rows:
+        try:
+            total = int(count_rows[0].get("total") or 0)
+        except (TypeError, ValueError):
+            total = 0
+    return jsonify({"ok": True, "returns": items,
+                    "counts": {"total": total}}), 200
+
+
+@bp.get("/checkout/returns/export")
+def returns_export():
+    """Returns ledger (newest first, 2000) as a CSV download."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_returns_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT r.created_at, l.title, l.total, r.reason, r.note"
+                    " FROM " + portal_db._q(RETURNS_TABLE) + " r"
+                    " LEFT JOIN " + portal_db._q(LINKS_TABLE) +
+                    " l ON l.id = r.link_id AND l.client_id = r.client_id"
+                    " WHERE r.client_id = %s"
+                    " ORDER BY r.id DESC LIMIT 2000",
+                    (principal["client_id"],),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("returns export failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "returns export")[0]), 503
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["date", "order", "amount", "reason", "note"])
+    for row in found:
+        writer.writerow([
+            row.get("created_at").date().isoformat()
+            if row.get("created_at") else "",
+            row.get("title"),
+            row.get("total"),
+            row.get("reason"),
+            row.get("note"),
+        ])
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition":
+                 "attachment; filename=omniflow-returns.csv"},
+    )
