@@ -43,6 +43,7 @@ from portal_fraud import bp as portal_fraud_bp  # noqa: E402
 from portal_compliance import bp as portal_compliance_bp  # noqa: E402
 from portal_negotiation import bp as portal_negotiation_bp  # noqa: E402
 from portal_checkout import bp as portal_checkout_bp  # noqa: E402
+from portal_digest import bp as portal_digest_bp  # noqa: E402
 from portal_listen import bp as portal_listen_bp  # noqa: E402
 from portal_routing import bp as portal_routing_bp  # noqa: E402
 from portal_reco import bp as portal_reco_bp  # noqa: E402
@@ -87,6 +88,7 @@ aux_app.register_blueprint(portal_fraud_bp)
 aux_app.register_blueprint(portal_compliance_bp)
 aux_app.register_blueprint(portal_negotiation_bp)
 aux_app.register_blueprint(portal_checkout_bp)
+aux_app.register_blueprint(portal_digest_bp)
 aux_app.register_blueprint(portal_listen_bp)
 aux_app.register_blueprint(portal_routing_bp)
 aux_app.register_blueprint(portal_reco_bp)
