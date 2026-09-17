@@ -9,11 +9,14 @@ stored status. Lead scoring: a deterministic 0-100 score + temperature is
 recomputed on every inbound message. All deterministic: zero AI cost.
 """
 
+import csv
+import io
 import logging
 import re
 from typing import Any, Dict, List, Optional
 
 from flask import Blueprint, jsonify, request
+from flask import Response
 
 from portal_auth import PortalAuthUnavailable, authenticate_portal_request
 import portal_db
@@ -547,3 +550,49 @@ def delete_order(order_id: int):
         return jsonify({"error": {"code": "not_found",
                                   "message": "Order not found."}}), 404
     return jsonify({"ok": True}), 200
+
+
+@bp.get("/revenue/export")
+def revenue_export():
+    """Paid-order ledger (newest first, 2000) as a CSV download."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, title, status, total, updated_at FROM "
+                    + portal_db._q(LINKS_TABLE) +
+                    " WHERE client_id = %s"
+                    " AND status IN ('paid', 'shipped', 'delivered')"
+                    " ORDER BY updated_at DESC NULLS LAST, id DESC"
+                    " LIMIT 2000",
+                    (principal["client_id"],),
+                )
+                found = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("revenue export failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "revenue export")[0]), 503
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(["date", "order", "status", "amount"])
+    for row in found:
+        writer.writerow([
+            row.get("updated_at").date().isoformat()
+            if row.get("updated_at") else "",
+            row.get("title"),
+            row.get("status"),
+            row.get("total"),
+        ])
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition":
+                 "attachment; filename=omniflow-revenue.csv"},
+    )
