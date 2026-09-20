@@ -122,7 +122,10 @@ def _ensure_checkout_tables(conn) -> None:
             " ADD COLUMN IF NOT EXISTS paid_amount NUMERIC(12,2)"
             " NOT NULL DEFAULT 0,"
             " ADD COLUMN IF NOT EXISTS discount NUMERIC(12,2)"
-            " NOT NULL DEFAULT 0"
+            " NOT NULL DEFAULT 0,"
+            " ADD COLUMN IF NOT EXISTS courier TEXT NOT NULL DEFAULT '',"
+            " ADD COLUMN IF NOT EXISTS tracking_number"
+            " TEXT NOT NULL DEFAULT ''"
         )
     conn.commit()
     _CHECKOUT_DDL_READY = True
@@ -410,6 +413,8 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "expires_at": _iso(row.get("expires_at")),
         "view_count": int(row.get("view_count") or 0),
         "discount": round(float(row.get("discount") or 0), 2),
+        "courier": str(row.get("courier") or ""),
+        "tracking_number": str(row.get("tracking_number") or ""),
         "paid_amount": round(float(row.get("paid_amount") or 0), 2),
         "due": max(
             round(float(row.get("total") or 0)
@@ -515,7 +520,8 @@ def list_checkout_links():
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
-                    " status, created_at, expires_at, view_count, discount"
+                    " status, created_at, expires_at, view_count, discount,"
+                    " courier, tracking_number"
                     " FROM " + portal_db._q(LINKS_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT 30",
                     (principal["client_id"],),
@@ -928,6 +934,61 @@ def share_checkout_link(link_id: int):
     return jsonify({"ok": True}), 200
 
 
+@bp.patch("/checkout/links/<int:link_id>/tracking")
+def set_checkout_tracking(link_id: int):
+    """Record courier + tracking number on a checkout link (COD trips)."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    payload = request.get_json(silent=True) or {}
+    courier = str(payload.get("courier") or "").strip()[:40]
+    tracking_number = str(payload.get("tracking_number") or "").strip()[:60]
+    if not tracking_number:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enter the tracking"
+                                             " number."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_checkout_tables(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE " + portal_db._q(LINKS_TABLE) +
+                    " SET courier = %s, tracking_number = %s,"
+                    " updated_at = NOW()"
+                    " WHERE id = %s AND client_id = %s RETURNING id",
+                    (courier, tracking_number, link_id,
+                     principal["client_id"]),
+                )
+                updated = portal_db.rows(cur)
+                if not updated:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Link not"
+                                                         " found."}}), 404
+                portal_db.log_action(
+                    cur,
+                    principal["client_id"],
+                    "checkout.tracking",
+                    "customer_user",
+                    principal.get("user_id"),
+                    None,
+                    ("Tracking " + tracking_number[:20] + " via "
+                     + (courier or "courier"))[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("checkout tracking failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "checkout tracking")[0]), 503
+    return jsonify({"ok": True}), 200
+
+
 @bp.get("/checkout/settings")
 def get_checkout_settings():
     principal, error = _principal_or_error()
@@ -1111,7 +1172,8 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
-                    " status, created_at, expires_at, view_count, discount"
+                    " status, created_at, expires_at, view_count, discount,"
+                    " courier, tracking_number"
                     " FROM " + portal_db._q(LINKS_TABLE) +
                     " WHERE token = %s LIMIT 1",
                     (token,),
