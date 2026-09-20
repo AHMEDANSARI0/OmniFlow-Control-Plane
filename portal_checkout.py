@@ -426,6 +426,8 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "expires_at": _iso(row.get("expires_at")),
         "view_count": int(row.get("view_count") or 0),
         "discount": round(float(row.get("discount") or 0), 2),
+        "coupon_code": str(row.get("coupon_code") or ""),
+        "coupon_discount": round(float(row.get("coupon_discount") or 0), 2),
         "courier": str(row.get("courier") or ""),
         "tracking_number": str(row.get("tracking_number") or ""),
         "paid_amount": round(float(row.get("paid_amount") or 0), 2),
@@ -538,7 +540,8 @@ def list_checkout_links():
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"
-                    " courier, tracking_number"
+                    " courier, tracking_number, coupon_code,"
+                    " coupon_discount"
                     " FROM " + portal_db._q(LINKS_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT 30",
                     (principal["client_id"],),
@@ -1202,7 +1205,8 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"
-                    " courier, tracking_number"
+                    " courier, tracking_number, coupon_code,"
+                    " coupon_discount"
                     " FROM " + portal_db._q(LINKS_TABLE) +
                     " WHERE token = %s LIMIT 1",
                     (token,),

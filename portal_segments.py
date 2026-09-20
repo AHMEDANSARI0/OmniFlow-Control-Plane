@@ -2,7 +2,7 @@
 
 import json
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -367,6 +367,24 @@ def delete_segment(segment_id: int):
         return jsonify({"error": {"code": "not_found",
                                   "message": "Segment not found."}}), 404
     return jsonify({"ok": True}), 200
+
+
+def segment_member_rows(cur, client_id, segment_id) -> List[Dict[str, Any]]:
+    """Public member resolver for scheduled broadcasts (portal_growth).
+
+    Same resolution as an instant segment broadcast: load the segment's
+    saved filters, then run the live member query (cap included).
+    """
+    row = _load_segment(cur, client_id, segment_id)
+    if not row:
+        return []
+    filters = row.get("filters")
+    if isinstance(filters, str):
+        try:
+            filters = json.loads(filters)
+        except (TypeError, ValueError):
+            filters = {}
+    return _member_rows(cur, client_id, filters or {}, BROADCAST_CAP)
 
 
 @bp.post("/segments/<int:segment_id>/broadcast")

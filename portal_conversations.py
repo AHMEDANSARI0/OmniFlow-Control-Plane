@@ -1478,6 +1478,11 @@ def _validate_business_hours(config) -> list:
     message = config.get("away_message")
     if not isinstance(message, str) or len(message) > 500:
         problems.append("away_message must be at most 500 characters.")
+    for variant_key in ("away_message_ur", "away_message_roman"):
+        variant = config.get(variant_key)
+        if variant is not None and (not isinstance(variant, str)
+                                    or len(variant) > 500):
+            problems.append(variant_key + " must be at most 500 characters.")
     return problems
 
 

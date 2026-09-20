@@ -130,6 +130,8 @@ def _audience_clause(audience: str) -> Tuple[str, List[Any]]:
 
 
 def _resolve_recipients(cur, client_id, audience) -> List[Dict[str, Any]]:
+    if audience.startswith("segment:"):
+        return _segment_recipients(cur, client_id, int(audience[8:]))
     clause, extra = _audience_clause(audience)
     cur.execute(
         "SELECT c.contact_id, MAX(c.contact_name) AS contact_name FROM "
@@ -139,6 +141,28 @@ def _resolve_recipients(cur, client_id, audience) -> List[Dict[str, Any]]:
         [client_id] + extra,
     )
     return portal_db.rows(cur)
+
+
+def _valid_audience(audience: str) -> bool:
+    """all/open/hot or segment:<id> (saved-segment scheduled sends)."""
+    if audience in AUDIENCES:
+        return True
+    return audience.startswith("segment:") and audience[8:].isdigit()
+
+
+def _segment_recipients(cur, client_id, segment_id) -> List[Dict[str, Any]]:
+    """Members of a saved segment, resolved at schedule AND send time.
+
+    Deferred import avoids the portal_segments cycle (segments import
+    growth for _send_command); a missing/broken segment resolves to no
+    recipients so the schedule/save path reports it honestly.
+    """
+    try:
+        import portal_segments
+
+        return portal_segments.segment_member_rows(cur, client_id, segment_id)
+    except Exception:
+        return []
 
 
 def _send_command(cur, client_id, external_user_id, display_name, body,
@@ -302,7 +326,7 @@ def schedule_broadcast():
     payload = request.get_json(silent=True) or {}
     audience = str(payload.get("audience") or "all").strip().lower()
     body = str(payload.get("body") or "").strip()
-    if audience not in AUDIENCES:
+    if not _valid_audience(audience):
         return jsonify({"error": {"code": "bad_request",
                                   "message": "audience must be all, open, or hot."}}), 400
     if not body:
@@ -362,7 +386,7 @@ def schedule_broadcast():
                     None,
                     "Broadcast scheduled for "
                     + send_at.isoformat() + " ("
-                    + AUDIENCE_LABELS[audience] + ").",
+                    + AUDIENCE_LABELS.get(audience, audience) + ").",
                 )
             conn.commit()
         finally:

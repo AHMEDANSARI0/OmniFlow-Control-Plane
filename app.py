@@ -28,6 +28,8 @@ from connector_api import bp as connector_api_bp  # noqa: E402
 from portal_followups import bp as portal_followups_bp  # noqa: E402
 from portal_kb import bp as portal_kb_bp  # noqa: E402
 from portal_catalog import bp as portal_catalog_bp  # noqa: E402
+from portal_changes import bp as portal_changes_bp  # noqa: E402
+from portal_coupons import bp as portal_coupons_bp  # noqa: E402
 from portal_analytics import bp as portal_analytics_bp  # noqa: E402
 from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
 from portal_interactive import bp as portal_interactive_bp  # noqa: E402
@@ -78,6 +80,8 @@ aux_app.register_blueprint(connector_api_bp)
 aux_app.register_blueprint(portal_followups_bp)
 aux_app.register_blueprint(portal_kb_bp)
 aux_app.register_blueprint(portal_catalog_bp)
+aux_app.register_blueprint(portal_changes_bp)
+aux_app.register_blueprint(portal_coupons_bp)
 aux_app.register_blueprint(portal_analytics_bp)
 aux_app.register_blueprint(portal_datasafety_bp)
 aux_app.register_blueprint(portal_interactive_bp)

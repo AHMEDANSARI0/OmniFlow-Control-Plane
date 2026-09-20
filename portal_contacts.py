@@ -543,6 +543,29 @@ def resolve_action_request(action_id: int):
     return jsonify({"ok": True, "status": status}), 200
 
 
+def stored_language(cur, client_id, contact_id) -> Optional[str]:
+    """Best-effort stored auto-detected language for a contact (or None).
+
+    Read-only helper for auto-reply paths (away messages etc.) - never
+    raises into the caller's transaction.
+    """
+    if not contact_id:
+        return None
+    try:
+        cur.execute(
+            "SELECT lang FROM " + portal_db._q(LANG_TABLE) +
+            " WHERE client_id = %s AND contact_id = %s LIMIT 1",
+            (client_id, str(contact_id)[:100]),
+        )
+        rows = portal_db.rows(cur)
+    except Exception:
+        return None
+    if not rows:
+        return None
+    lang = str(rows[0].get("lang") or "").strip().lower()
+    return lang or None
+
+
 def maybe_detect_language(client_id, contact, text, conn):
     """Store the auto-detected language on first sight of a contact. Runs in
     the ingest transaction; never raises into the caller."""

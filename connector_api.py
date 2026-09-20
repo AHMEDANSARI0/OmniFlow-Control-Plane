@@ -473,6 +473,19 @@ def _maybe_enqueue_away_reply(client_id, conversation_id, contact_id, direction,
         )
         if portal_db.rows(cur):
             return
+        try:
+            contact_lang = portal_contacts.stored_language(
+                cur, client_id, contact_id)
+        except Exception:
+            contact_lang = None
+        if contact_lang == "ur":
+            variant = config.get("away_message_ur")
+        elif contact_lang == "roman":
+            variant = config.get("away_message_roman")
+        else:
+            variant = None
+        if isinstance(variant, str) and variant.strip():
+            message = variant
         cur.execute(
             "INSERT INTO " + portal_db._q("portal_away_replies") +
             " (client_id, conversation_id, contact_id, body)"
@@ -601,6 +614,16 @@ def ingest_whatsapp_messages():
             body = ""
         elif not isinstance(body, str):
             body = str(body)
+        try:
+            import portal_interactive
+
+            reply_body = portal_interactive.interactive_body_override(
+                item.get("interactive"), body
+            )
+            if reply_body is not None:
+                body = reply_body
+        except Exception:
+            pass
         direction = item.get("direction", "in")
         if direction not in ALLOWED_DIRECTIONS:
             return jsonify({"error": {"code": "bad_request",
