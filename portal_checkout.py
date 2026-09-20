@@ -68,6 +68,19 @@ DEFAULT_CART_TEMPLATES = {
 MAX_ITEMS = 20
 MAX_QTY = 99
 MAX_TITLE = 120
+MONEY_ROLES = ("owner", "admin")
+
+
+def ensure_money_principal(principal: Dict[str, Any],
+                           message: Optional[str] = None) -> Optional[Any]:
+    """Money guard: only owners/admins may record advances or discounts.
+    Agents (and anything else) get a 403 - the server is the boundary."""
+    if str(principal.get("role") or "") not in MONEY_ROLES:
+        return jsonify({"error": {"code": "forbidden",
+                                  "message": message or "Only owners can"
+                                                        " record advances"
+                                                        " or discounts."}}), 403
+    return None
 
 _CHECKOUT_DDL_READY = False
 
@@ -455,6 +468,10 @@ def create_checkout_link():
                                                  " 0 and 100000."}}), 400
     else:
         discount_amount = 0
+    if discount_amount and discount_amount > 0:
+        forbidden = ensure_money_principal(principal)
+        if forbidden is not None:
+            return forbidden
     total = max(round(subtotal - discount_amount, 2), 0)
     expires_days = payload.get("expires_in_days")
     if expires_days is not None:
@@ -558,6 +575,11 @@ def update_checkout_link(link_id: int):
                                              " (size, fit, damaged, late,"
                                              " changed_mind or"
                                              " other)."}}), 400
+    if status == "paid":
+        forbidden = ensure_money_principal(
+            principal, "Only owners can mark links paid.")
+        if forbidden is not None:
+            return forbidden
     try:
         portal_db.ensure_tables()
         conn = portal_db._conn()
@@ -677,6 +699,10 @@ def edit_checkout_link(link_id: int):
                                                  " 0 and 100000."}}), 400
     else:
         discount_amount = 0
+    if discount_amount and discount_amount > 0:
+        forbidden = ensure_money_principal(principal)
+        if forbidden is not None:
+            return forbidden
     total = max(round(subtotal - discount_amount, 2), 0)
     expires_days = payload.get("expires_in_days")
     if expires_days is not None:
@@ -807,6 +833,9 @@ def add_checkout_advance(link_id: int):
     if error:
         return error
     forbidden = ensure_human_principal(principal)
+    if forbidden is not None:
+        return forbidden
+    forbidden = ensure_money_principal(principal)
     if forbidden is not None:
         return forbidden
     payload = request.get_json(silent=True) or {}
