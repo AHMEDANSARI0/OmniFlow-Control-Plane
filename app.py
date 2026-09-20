@@ -31,6 +31,7 @@ from portal_catalog import bp as portal_catalog_bp  # noqa: E402
 from portal_analytics import bp as portal_analytics_bp  # noqa: E402
 from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
 from portal_interactive import bp as portal_interactive_bp  # noqa: E402
+from portal_wati import bp as portal_wati_bp  # noqa: E402
 from portal_revenue import bp as portal_revenue_bp  # noqa: E402
 from portal_payments import bp as portal_payments_bp  # noqa: E402
 from portal_restock import bp as portal_restock_bp  # noqa: E402
@@ -80,6 +81,7 @@ aux_app.register_blueprint(portal_catalog_bp)
 aux_app.register_blueprint(portal_analytics_bp)
 aux_app.register_blueprint(portal_datasafety_bp)
 aux_app.register_blueprint(portal_interactive_bp)
+aux_app.register_blueprint(portal_wati_bp)
 aux_app.register_blueprint(portal_revenue_bp)
 aux_app.register_blueprint(portal_payments_bp)
 aux_app.register_blueprint(portal_payments_public_bp)
