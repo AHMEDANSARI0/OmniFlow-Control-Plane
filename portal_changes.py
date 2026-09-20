@@ -149,6 +149,22 @@ def submit_change_request(token: str):
         try:
             _ensure_changes_tables(conn)
             with conn.cursor() as cur:
+                try:
+                    import portal_ratelimit
+
+                    if not portal_ratelimit.allow(
+                        cur,
+                        "changereq:" + token,
+                        portal_ratelimit.checkout_post_limit(),
+                        60,
+                    ):
+                        conn.commit()
+                        return jsonify({"error": {
+                            "code": "rate_limited",
+                            "message": "Too many requests; try again shortly.",
+                        }}), 429
+                except Exception:
+                    pass
                 link = _load_link_by_token(cur, token)
                 if link is None:
                     return jsonify({"error": {"code": "not_found",

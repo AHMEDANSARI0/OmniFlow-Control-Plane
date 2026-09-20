@@ -234,8 +234,12 @@ def _send_cod_message(cur, client_id, contact_id, display_name, body, request_id
 
 
 def maybe_cod_flow(client_id, conversation_id, contact_id, contact_name,
-                   body, direction, conn) -> None:
-    """Ingest hook: ask hot leads to confirm COD orders, parse their reply."""
+                   body, direction, conn) -> Optional[bool]:
+    """Ingest hook: ask hot leads to confirm COD orders, parse their reply.
+
+    Returns True only when this hook queued a customer-visible message
+    (the confirmation ask) — the ingest pipeline's one-reply law uses it.
+    """
     if direction != "in":
         return
     text = str(body or "").strip()
@@ -263,10 +267,17 @@ def maybe_cod_flow(client_id, conversation_id, contact_id, contact_name,
         pending = portal_db.rows(cur)
         if pending:
             request_id = int(pending[0].get("id") or 0)
-            if _NO_RE.match(text):
-                new_status = "declined"
-            elif _YES_RE.match(text):
+            reply_kind = "cod_other"
+            try:
+                import portal_intents
+
+                reply_kind = portal_intents.parse_cod_reply(text)
+            except Exception:
+                reply_kind = "cod_other"
+            if reply_kind == "cod_confirm":
                 new_status = "confirmed"
+            elif reply_kind == "cod_cancel":
+                new_status = "declined"
             else:
                 return
             cur.execute(
@@ -332,3 +343,4 @@ def maybe_cod_flow(client_id, conversation_id, contact_id, contact_name,
             conversation_id,
             "COD confirmation asked (" + str(request_id) + ").",
         )
+        return True

@@ -441,6 +441,22 @@ def public_callback(intent_token: str):
             _ensure_settings_table(conn)
             portal_checkout._ensure_checkout_tables(conn)
             with conn.cursor() as cur:
+                try:
+                    import portal_ratelimit
+
+                    if not portal_ratelimit.allow(
+                        cur,
+                        "paycb:" + intent_token,
+                        portal_ratelimit.checkout_post_limit(),
+                        60,
+                    ):
+                        conn.commit()
+                        return jsonify({"error": {
+                            "code": "rate_limited",
+                            "message": "Too many requests; try again shortly.",
+                        }}), 429
+                except Exception:
+                    pass
                 cur.execute(
                     "SELECT id, client_id, link_id, amount, status,"
                     " provider FROM " + portal_db._q(INTENTS_TABLE) +

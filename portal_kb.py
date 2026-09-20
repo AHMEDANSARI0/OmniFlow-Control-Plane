@@ -32,6 +32,30 @@ KB_TABLE = "portal_kb_entries"
 # the follow-up agent are deliberately excluded.
 KB_AUTO_INTENTS = ("general", "shipping", "order_tracking", "appointment")
 
+_INTENT_HINTS = (
+    ("order_tracking", ("track", "tracking", "kahan", "status of my order",
+                        "order status", "mera order")),
+    ("shipping", ("delivery", "shipping", "charge", "kitne din", "courier",
+                  "pahunch")),
+    ("appointment", ("appointment", "booking", "book", "appointment time")),
+)
+
+
+def classify_intent(message_text) -> str:
+    """Coarse intent for the KB auto-reply gate (keyword hints first).
+
+    B3: portal_intents.classify wraps this table as its offline fallback —
+    callers get the LLM label when configured, keywords otherwise.
+    """
+    text = _normalize_text(message_text)
+    if not text:
+        return "general"
+    for intent, hints in _INTENT_HINTS:
+        for hint in hints:
+            if hint in text:
+                return intent
+    return "general"
+
 MIN_KEYWORD_SCORE = 3  # one keyword hit = 3 points
 AUTO_REPLY_COOLDOWN_SECONDS = 120
 MAX_LIST_ENTRIES = 200
@@ -202,6 +226,7 @@ def maybe_auto_reply(client_id, conversation_id, contact_id, contact_name,
             " SET usage_count = usage_count + 1 WHERE id = %s",
             (entry.get("id"),),
         )
+        return True
         portal_db.log_action(
             cur,
             client_id,

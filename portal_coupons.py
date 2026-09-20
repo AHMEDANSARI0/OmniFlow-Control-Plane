@@ -409,6 +409,22 @@ def apply_coupon(token: str):
         try:
             _ensure_coupons_tables(conn)
             with conn.cursor() as cur:
+                try:
+                    import portal_ratelimit
+
+                    if not portal_ratelimit.allow(
+                        cur,
+                        "coupon:" + token,
+                        portal_ratelimit.checkout_post_limit(),
+                        60,
+                    ):
+                        conn.commit()
+                        return jsonify({"error": {
+                            "code": "rate_limited",
+                            "message": "Too many requests; try again shortly.",
+                        }}), 429
+                except Exception:
+                    pass
                 link = _load_link(cur, token)
                 if link is None:
                     return jsonify({"error": {"code": "not_found",

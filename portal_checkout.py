@@ -1202,6 +1202,23 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
         try:
             _ensure_checkout_tables(conn)
             with conn.cursor() as cur:
+                try:
+                    import portal_ratelimit
+
+                    if not portal_ratelimit.allow(
+                        cur,
+                        "checkout:" + token,
+                        portal_ratelimit.checkout_limit(),
+                        60,
+                    ):
+                        conn.commit()
+                        return ({"error": {
+                            "code": "rate_limited",
+                            "message": "Too many requests; try again"
+                                       " shortly.",
+                        }}, 429)
+                except Exception:
+                    pass
                 cur.execute(
                     "SELECT id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"

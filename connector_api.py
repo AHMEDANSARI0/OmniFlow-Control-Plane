@@ -232,10 +232,19 @@ def list_commands():
                     )
                 except Exception:
                     pass
+                try:
+                    import portal_events
+
+                    portal_events.requeue_due_commands(
+                        cur, tenant["client_id"]
+                    )
+                except Exception:
+                    pass
                 cmd_sql = (
                     "SELECT id, action, payload, created_at FROM "
                     + portal_db._q(portal_db.CMD_TABLE) +
                     " WHERE client_id = %s AND status = 'pending'"
+                    " AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())"
                 )
                 cmd_params: list = [tenant["client_id"]]
                 if channel:
@@ -290,6 +299,19 @@ def ack_command():
                     "WHERE id = %s AND client_id = %s RETURNING id",
                     ("done" if ok_flag else "failed", note, command_id, tenant["client_id"]),
                 )
+                try:
+                    import portal_events
+
+                    portal_events.on_command_ack(
+                        cur,
+                        tenant["client_id"],
+                        command_id,
+                        ok_flag,
+                        note,
+                        payload.get("provider_message_id"),
+                    )
+                except Exception:
+                    pass
                 updated = portal_db.rows(cur)
             conn.commit()
         finally:
@@ -443,7 +465,7 @@ def _away_closed_now(config) -> bool:
         return False
 
 
-def _maybe_enqueue_away_reply(client_id, conversation_id, contact_id, direction, conn):
+def _maybe_enqueue_away_reply(client_id, conversation_id, contact_id, direction, conn) -> Optional[bool]:
     """Queue one automatic away reply, inside the ingest transaction.
 
     Fires only for inbound messages while business hours are enabled and
@@ -492,6 +514,7 @@ def _maybe_enqueue_away_reply(client_id, conversation_id, contact_id, direction,
             " VALUES (%s, %s, %s, %s)",
             (client_id, conversation_id, contact_id, message.strip()),
         )
+        return True
 
 
 @bp.get("/away-replies")
@@ -511,6 +534,7 @@ def list_due_away_replies():
                     "SELECT id, contact_id, body, created_at FROM " +
                     portal_db._q("portal_away_replies") +
                     " WHERE client_id = %s AND status = 'pending'"
+                    " AND (next_attempt_at IS NULL OR next_attempt_at <= NOW())"
                     " ORDER BY id ASC LIMIT %s",
                     (tenant["client_id"], limit),
                 )
@@ -648,7 +672,32 @@ def ingest_whatsapp_messages():
         conn = portal_db._conn()
         try:
             with conn.cursor() as cur:
+                try:
+                    import portal_ratelimit
+
+                    if not portal_ratelimit.allow(
+                        cur,
+                        "ingest:" + str(tenant["client_id"]),
+                        portal_ratelimit.ingest_limit(),
+                        60,
+                    ):
+                        conn.commit()
+                        return jsonify({"error": {
+                            "code": "rate_limited",
+                            "message": "Too many messages; slow down.",
+                        }}), 429
+                except Exception:
+                    pass
                 for item in normalized:
+                    try:
+                        import portal_events
+
+                        if not portal_events.record_inbound(
+                            cur, tenant["client_id"], item
+                        ):
+                            continue
+                    except Exception:
+                        pass
                     cur.execute(
                         "INSERT INTO " + portal_db._q(portal_db.CONV_TABLE) +
                         " (client_id, channel, contact_id, contact_name,"
@@ -676,28 +725,65 @@ def ingest_whatsapp_messages():
                          item["body"], item["name"],
                          "received" if item["direction"] == "in" else "sent"),
                     )
-                    try:
-                        _maybe_enqueue_away_reply(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["direction"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        portal_cod.maybe_cod_flow(
-                            tenant["client_id"],
-                            conversation_id,
-                            item["from"],
-                            item["name"],
-                            item["body"],
-                            item["direction"],
-                            conn,
-                        )
-                    except Exception:
-                        pass
+                    # One-reply law (B2): the first automation that sends a
+                    # customer-visible reply claims the message; the other
+                    # reply hooks stay quiet. Side-effect hooks (language
+                    # detection, compliance, listen, routing, sequences)
+                    # always run.
+                    claimed_by = None
+                    if claimed_by is None:
+                        try:
+                            if _maybe_enqueue_away_reply(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["direction"],
+                                conn,
+                            ):
+                                claimed_by = "away"
+                        except Exception:
+                            pass
+                    if claimed_by is None:
+                        try:
+                            if portal_cod.maybe_cod_flow(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["name"],
+                                item["body"],
+                                item["direction"],
+                                conn,
+                            ):
+                                claimed_by = "cod"
+                        except Exception:
+                            pass
+                    if claimed_by is None:
+                        try:
+                            import portal_kb
+                            import portal_intents
+
+                            intent = portal_intents.classify(item["body"])
+                            if portal_kb.maybe_auto_reply(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["name"],
+                                item["body"],
+                                intent,
+                                conn,
+                            ):
+                                claimed_by = "kb"
+                        except Exception:
+                            pass
+                    if claimed_by:
+                        try:
+                            import portal_events
+
+                            portal_events.note_claim(
+                                cur, tenant["client_id"], item, claimed_by
+                            )
+                        except Exception:
+                            pass
                     try:
                         portal_contacts.maybe_detect_language(
                             tenant["client_id"],
@@ -769,6 +855,14 @@ def ingest_whatsapp_messages():
                             tenant["client_id"],
                             conversation_id,
                             conn,
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        import portal_events
+
+                        portal_events.mark_inbound_done(
+                            cur, tenant["client_id"], item
                         )
                     except Exception:
                         pass
