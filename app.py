@@ -35,6 +35,8 @@ from portal_alerts import bp as portal_alerts_bp  # noqa: E402
 from portal_brain import bp as portal_brain_bp  # noqa: E402
 from portal_memory import bp as portal_memory_bp  # noqa: E402
 from portal_recovery import bp as portal_recovery_bp  # noqa: E402
+from portal_risk import bp as portal_risk_bp  # noqa: E402
+from portal_courier import bp as portal_courier_bp  # noqa: E402
 from portal_analytics import bp as portal_analytics_bp  # noqa: E402
 from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
 from portal_interactive import bp as portal_interactive_bp  # noqa: E402
@@ -126,6 +128,8 @@ aux_app.register_blueprint(portal_alerts_bp)
 aux_app.register_blueprint(portal_brain_bp)
 aux_app.register_blueprint(portal_memory_bp)
 aux_app.register_blueprint(portal_recovery_bp)
+aux_app.register_blueprint(portal_risk_bp)
+aux_app.register_blueprint(portal_courier_bp)
 _install_obs(aux_app)
 
 _EXTENSION_PREFIXES = (
