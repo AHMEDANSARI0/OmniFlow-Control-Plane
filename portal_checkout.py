@@ -864,7 +864,7 @@ def add_checkout_advance(link_id: int):
                     " >= total THEN 'paid' ELSE status END,"
                     " updated_at = NOW()"
                     " WHERE id = %s AND client_id = %s AND status = 'open'"
-                    " RETURNING paid_amount, total, status",
+                    " RETURNING paid_amount, total, status, contact_id",
                     (amount, amount, link_id, principal["client_id"]),
                 )
                 updated = portal_db.rows(cur)
@@ -875,6 +875,16 @@ def add_checkout_advance(link_id: int):
                                                          " advance."}}), 404
                 new_paid = round(float(updated[0].get("paid_amount") or 0), 2)
                 new_total = round(float(updated[0].get("total") or 0), 2)
+                if new_paid >= new_total and updated[0].get("contact_id"):
+                    try:
+                        import portal_memory
+
+                        portal_memory.note_purchase(
+                            cur, principal["client_id"],
+                            str(updated[0].get("contact_id")),
+                        )
+                    except Exception:
+                        pass
                 portal_db.log_action(
                     cur,
                     principal["client_id"],
