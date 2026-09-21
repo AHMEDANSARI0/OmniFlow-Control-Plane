@@ -262,6 +262,14 @@ def on_command_ack(
                 command_id, client_id,
             ),
         )
+        try:
+            import portal_alerts
+
+            portal_alerts.alert_dead_command(
+                cur, client_id, command_id, note
+            )
+        except Exception:
+            pass
     except Exception:
         pass
 

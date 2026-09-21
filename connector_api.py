@@ -759,6 +759,21 @@ def ingest_whatsapp_messages():
                             pass
                     if claimed_by is None:
                         try:
+                            import portal_brain
+
+                            if portal_brain.maybe_answer(
+                                tenant["client_id"],
+                                conversation_id,
+                                item["from"],
+                                item["name"],
+                                item["body"],
+                                conn,
+                            ):
+                                claimed_by = "brain"
+                        except Exception:
+                            pass
+                    if claimed_by is None:
+                        try:
                             import portal_kb
                             import portal_intents
 

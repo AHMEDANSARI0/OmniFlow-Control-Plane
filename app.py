@@ -31,6 +31,8 @@ from portal_catalog import bp as portal_catalog_bp  # noqa: E402
 from portal_changes import bp as portal_changes_bp  # noqa: E402
 from portal_coupons import bp as portal_coupons_bp  # noqa: E402
 from portal_events import bp as portal_events_bp  # noqa: E402
+from portal_alerts import bp as portal_alerts_bp  # noqa: E402
+from portal_brain import bp as portal_brain_bp  # noqa: E402
 from portal_analytics import bp as portal_analytics_bp  # noqa: E402
 from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
 from portal_interactive import bp as portal_interactive_bp  # noqa: E402
@@ -63,6 +65,8 @@ from portal_webhooks import bp as portal_webhooks_bp  # noqa: E402
 from portal_sequences import bp as portal_sequences_bp  # noqa: E402
 from portal_widget import bp as portal_widget_bp  # noqa: E402
 from portal_auth import bind_root_application  # noqa: E402
+from portal_rollups import bp as portal_rollups_bp  # noqa: E402
+from portal_obs import install_obs as _install_obs  # noqa: E402
 
 
 # --- Extension endpoints (password reset + admin + portal + connector) ------
@@ -115,6 +119,10 @@ aux_app.register_blueprint(portal_setup_bp)
 aux_app.register_blueprint(portal_webhooks_bp)
 aux_app.register_blueprint(portal_sequences_bp)
 aux_app.register_blueprint(portal_widget_bp)
+aux_app.register_blueprint(portal_rollups_bp)
+aux_app.register_blueprint(portal_alerts_bp)
+aux_app.register_blueprint(portal_brain_bp)
+_install_obs(aux_app)
 
 _EXTENSION_PREFIXES = (
     "/api/v1/auth/forgot-password",
