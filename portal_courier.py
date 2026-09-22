@@ -39,6 +39,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from flask import Blueprint, jsonify, request
 
 import portal_db
+import portal_plans
 from portal_auth import (
     PortalAuthUnavailable,
     authenticate_portal_request,
@@ -1026,6 +1027,12 @@ def create_courier_provider():
     try:
         with conn.cursor() as cur:
             _ensure_ddl(cur)
+            blocked = portal_plans.enforce(cur,
+                                           int(principal["client_id"]),
+                                           "courier_providers",
+                                           "Courier company")
+            if blocked is not None:
+                return blocked
             cur.execute(
                 "INSERT INTO " + portal_db._q(PROVIDERS_TABLE) +
                 " (client_id, name, adapter, base_url, api_key,"

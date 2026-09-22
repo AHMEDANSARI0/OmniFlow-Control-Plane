@@ -40,7 +40,6 @@ SETTINGS_TABLE = "portal_checkout_settings"
 RETURN_REASONS = ("size", "fit", "damaged", "late", "changed_mind", "other")
 RETURNS_TABLE = "portal_return_requests"
 _RETURNS_DDL_READY = False
-SETTINGS_TABLE = "portal_checkout_settings"
 NOTIFY_STATUSES = ("paid", "shipped", "delivered", "returned")
 DEFAULT_TEMPLATES = {
     "paid": "Payment received for '{title}'. Thank you! Your order is"
@@ -138,7 +137,9 @@ def _ensure_checkout_tables(conn) -> None:
             " NOT NULL DEFAULT 0,"
             " ADD COLUMN IF NOT EXISTS courier TEXT NOT NULL DEFAULT '',"
             " ADD COLUMN IF NOT EXISTS tracking_number"
-            " TEXT NOT NULL DEFAULT ''"
+            " TEXT NOT NULL DEFAULT '',"
+            " ADD COLUMN IF NOT EXISTS advance_percent"
+            " INTEGER NOT NULL DEFAULT 0"
         )
     conn.commit()
     _CHECKOUT_DDL_READY = True
@@ -214,8 +215,23 @@ def _contact_name(cur, client_id, contact_id):
     return str(rows[0].get("contact_name") or "").strip()
 
 
-def _render_body(settings, status, contact_name, title, total):
-    """Fill {name}/{title}/{total}; blank custom template -> default."""
+def _money(value) -> str:
+    """Compact rupee amount: 250.0 -> "250", 99.55 -> "99.55"."""
+    try:
+        text = str(round(float(value), 2))
+    except (TypeError, ValueError):
+        return "0"
+    if text.endswith(".0"):
+        text = text[:-2]
+    return text
+
+
+def _render_body(settings, status, contact_name, title, total, row=None):
+    """Fill {name}/{title}/{total}; blank custom template -> default.
+
+    When the link still carries an outstanding balance (advance-COD), the
+    paid/shipped/delivered confirmation appends the amount due on delivery
+    so the customer is never surprised by the collection."""
     template = str(settings.get("tpl_" + str(status)) or "").strip()
     if not template:
         template = DEFAULT_TEMPLATES.get(str(status), "")
@@ -225,6 +241,16 @@ def _render_body(settings, status, contact_name, title, total):
             .replace("{name}", first_name)
             .replace("{title}", str(title or ""))
             .replace("{total}", str(total if total is not None else "")))
+    if row is not None and str(status) in ("paid", "shipped", "delivered"):
+        try:
+            row_total = round(float(row.get("total") or 0), 2)
+            paid = round(float(row.get("paid_amount") or 0), 2)
+        except (TypeError, ValueError):
+            row_total = paid = 0.0
+        balance = max(round(row_total - paid, 2), 0.0)
+        if balance > 0:
+            body = (body + " Rs " + _money(balance)
+                    + " will be collected on delivery.")
     return body[:1000]
 
 
@@ -403,6 +429,32 @@ def _normalize_items(raw: Any) -> Tuple[Optional[List[Dict[str, Any]]], Optional
     return items, None
 
 
+def _advance_due(row: Dict[str, Any]) -> float:
+    """Amount the customer pays now when the link carries an advance."""
+    try:
+        percent = int(row.get("advance_percent") or 0)
+    except (TypeError, ValueError):
+        percent = 0
+    if percent <= 0:
+        return 0.0
+    total = round(float(row.get("total") or 0)
+                  - float(row.get("paid_amount") or 0), 2)
+    return max(round(total * percent / 100.0, 2), 0.0)
+
+
+def _cod_balance(row: Dict[str, Any]) -> float:
+    """Rest that stays collectable on delivery."""
+    try:
+        percent = int(row.get("advance_percent") or 0)
+    except (TypeError, ValueError):
+        percent = 0
+    if percent <= 0:
+        return 0.0
+    total = round(float(row.get("total") or 0)
+                  - float(row.get("paid_amount") or 0), 2)
+    return max(round(total - _advance_due(row), 2), 0.0)
+
+
 def _public(row: Dict[str, Any]) -> Dict[str, Any]:
     items = row.get("items")
     if not isinstance(items, list):
@@ -431,6 +483,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "courier": str(row.get("courier") or ""),
         "tracking_number": str(row.get("tracking_number") or ""),
         "paid_amount": round(float(row.get("paid_amount") or 0), 2),
+        "advance_percent": int(row.get("advance_percent") or 0),
+        "advance_due": _advance_due(row),
+        "cod_balance": _cod_balance(row),
         "due": max(
             round(float(row.get("total") or 0)
                   - float(row.get("paid_amount") or 0), 2),
@@ -474,6 +529,18 @@ def create_checkout_link():
         forbidden = ensure_money_principal(principal)
         if forbidden is not None:
             return forbidden
+    advance_percent = payload.get("advance_percent")
+    if advance_percent is not None:
+        try:
+            advance_percent = int(advance_percent)
+        except (TypeError, ValueError):
+            advance_percent = -1
+        if not 0 <= advance_percent <= 90:
+            return jsonify({"error": {"code": "bad_request",
+                                      "message": "Advance percent must be"
+                                                 " between 0 and 90."}}), 400
+    else:
+        advance_percent = 0
     total = max(round(subtotal - discount_amount, 2), 0)
     expires_days = payload.get("expires_in_days")
     if expires_days is not None:
@@ -497,15 +564,16 @@ def create_checkout_link():
                 cur.execute(
                     "INSERT INTO " + portal_db._q(LINKS_TABLE) +
                     " (client_id, contact_id, token, title, items, total,"
-                    " discount, expires_at)"
+                    " discount, expires_at, advance_percent)"
                     " VALUES (%s, %s, %s, %s, CAST(%s AS JSONB), %s, %s,"
                     " CASE WHEN %s IS NULL THEN NULL"
-                    " ELSE NOW() + (%s * INTERVAL '1 day') END)"
+                    " ELSE NOW() + (%s * INTERVAL '1 day') END, %s)"
                     " RETURNING id, token, contact_id, title, items, total,"
-                    " status, created_at, expires_at, view_count, discount",
+                    " status, created_at, expires_at, view_count, discount,"
+                    " paid_amount, advance_percent",
                     (principal["client_id"], contact, token, title,
                      json.dumps(items), total, discount_amount,
-                     expires_days, expires_days),
+                     expires_days, expires_days, advance_percent),
                 )
                 created = portal_db.rows(cur)
                 portal_db.log_action(
@@ -515,7 +583,9 @@ def create_checkout_link():
                     "customer_user",
                     principal.get("user_id"),
                     None,
-                    ("Checkout link " + token[:8] + " (" + str(total) + ")")[:200],
+                    ("Checkout link " + token[:8] + " (" + str(total)
+                     + (", advance " + str(advance_percent) + "%"
+                        if advance_percent else "") + ")")[:200],
                 )
             conn.commit()
         finally:
@@ -541,7 +611,7 @@ def list_checkout_links():
                     "SELECT id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"
                     " courier, tracking_number, coupon_code,"
-                    " coupon_discount"
+                    " coupon_discount, paid_amount, advance_percent"
                     " FROM " + portal_db._q(LINKS_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT 30",
                     (principal["client_id"],),
@@ -593,7 +663,8 @@ def update_checkout_link(link_id: int):
                     "UPDATE " + portal_db._q(LINKS_TABLE) +
                     " SET status = %s, updated_at = NOW()"
                     " WHERE id = %s AND client_id = %s"
-                    " RETURNING token, contact_id, title, total",
+                    " RETURNING token, contact_id, title, total,"
+                    " paid_amount, advance_percent",
                     (status, link_id, principal["client_id"]),
                 )
                 updated = portal_db.rows(cur)
@@ -639,7 +710,8 @@ def update_checkout_link(link_id: int):
                             body = _render_body(
                                 settings, str(status), name,
                                 updated[0].get("title"),
-                                updated[0].get("total"))
+                                updated[0].get("total"),
+                                updated[0])
                             portal_growth._send_command(
                                 cur, principal["client_id"],
                                 updated[0].get("contact_id"), name, body,
@@ -864,7 +936,8 @@ def add_checkout_advance(link_id: int):
                     " >= total THEN 'paid' ELSE status END,"
                     " updated_at = NOW()"
                     " WHERE id = %s AND client_id = %s AND status = 'open'"
-                    " RETURNING paid_amount, total, status, contact_id",
+                    " RETURNING paid_amount, total, status, contact_id,"
+                    " title",
                     (amount, amount, link_id, principal["client_id"]),
                 )
                 updated = portal_db.rows(cur)
@@ -898,6 +971,46 @@ def add_checkout_advance(link_id: int):
                      + (" FULLY PAID"
                         if new_paid >= new_total else ""))[:200],
                 )
+                if updated[0].get("contact_id"):
+                    try:
+                        settings = _load_settings(
+                            cur, principal["client_id"])
+                        if settings["notify_enabled"]:
+                            name = _contact_name(
+                                cur, principal["client_id"],
+                                updated[0].get("contact_id"))
+                            if new_paid >= new_total:
+                                body = _render_body(
+                                    settings, "paid", name,
+                                    updated[0].get("title"), new_total)
+                            else:
+                                due_now = max(
+                                    round(new_total - new_paid, 2), 0.0)
+                                body = ("Rs " + _money(amount)
+                                        + " received for '"
+                                        + str(updated[0].get("title") or "")
+                                        + "'. Rs " + _money(due_now)
+                                        + " will be collected on"
+                                          " delivery.")
+                            portal_growth._send_command(
+                                cur, principal["client_id"],
+                                updated[0].get("contact_id"), name, body,
+                                "checkout_advance",
+                            )
+                            portal_db.log_action(
+                                cur,
+                                principal["client_id"],
+                                "checkout.notified",
+                                "customer_user",
+                                principal.get("user_id"),
+                                None,
+                                ("Advance confirmation queued (paid "
+                                 + str(new_paid) + "/" + str(new_total)
+                                 + ").")[:200],
+                            )
+                    except Exception as notify_error:
+                        logger.warning(
+                            "advance notify failed: %s", notify_error)
             conn.commit()
         finally:
             conn.close()
@@ -1233,7 +1346,7 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
                     "SELECT id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"
                     " courier, tracking_number, coupon_code,"
-                    " coupon_discount"
+                    " coupon_discount, paid_amount, advance_percent"
                     " FROM " + portal_db._q(LINKS_TABLE) +
                     " WHERE token = %s LIMIT 1",
                     (token,),

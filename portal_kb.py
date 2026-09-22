@@ -18,6 +18,7 @@ from flask import Blueprint, jsonify, request
 
 from portal_auth import PortalAuthUnavailable, authenticate_portal_request
 import portal_db
+import portal_plans
 
 
 logger = logging.getLogger("omniflow.portal-knowledge-base")
@@ -61,6 +62,29 @@ AUTO_REPLY_COOLDOWN_SECONDS = 120
 MAX_LIST_ENTRIES = 200
 
 
+_LANG_DDL_READY = False
+
+
+def _ensure_lang_column(conn) -> None:
+    """portal_kb_entries.lang lands lazily (older installs keep working)."""
+    global _LANG_DDL_READY
+    if _LANG_DDL_READY:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE " + portal_db._q(KB_TABLE) +
+                " ADD COLUMN IF NOT EXISTS lang TEXT NOT NULL DEFAULT 'auto'"
+            )
+        conn.commit()
+        _LANG_DDL_READY = True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def _principal_or_error():
     try:
         principal = authenticate_portal_request()
@@ -87,6 +111,7 @@ def _entry_json(row: Dict[str, Any]) -> Dict[str, Any]:
         "content": str(row.get("content") or ""),
         "is_active": row.get("is_active") is True,
         "usage_count": int(row.get("usage_count") or 0),
+        "lang": str(row.get("lang") or "auto"),
     }
 
 
@@ -116,13 +141,79 @@ def _clean_entry_payload(raw):
     if len(category) > 60:
         return None, (jsonify({"error": {"code": "bad_request",
                                          "message": "Category must be 60 characters or fewer."}}), 400)
+    lang = str(raw.get("lang") or "auto").strip().lower() or "auto"
+    if lang not in ("auto", "en", "ur", "roman"):
+        return None, (jsonify({"error": {"code": "bad_request",
+                                         "message": "lang must be auto, en,"
+                                                    " ur, or roman."}}), 400)
     return {
         "title": title,
         "content": content,
         "keywords": keywords,
         "category": category,
         "is_active": is_active,
+        "lang": lang,
     }, None
+
+
+def match_knowledge_base_lang(cur, client_id, message_text, lang=None):
+    """Language-aware twin of match_knowledge_base.
+
+    Same keyword scoring; when scores tie, an entry written in the
+    customer's stored language wins over 'auto', which wins over any other
+    language. Falls back to the classic SELECT when the lang column is not
+    installed yet, so the ingest hot path can never break.
+    """
+    normalized = _normalize_text(message_text)
+    if not normalized:
+        return None
+    tokens = set(normalized.split(" "))
+    want = str(lang or "").strip().lower()
+    try:
+        cur.execute(
+            "SELECT id, title, content, keywords, lang FROM "
+            + portal_db._q(KB_TABLE) +
+            " WHERE client_id = %s AND is_active IS TRUE LIMIT %s",
+            (client_id, MAX_LIST_ENTRIES),
+        )
+        rows = portal_db.rows(cur)
+    except Exception:
+        cur.execute(
+            "SELECT id, title, content, keywords FROM "
+            + portal_db._q(KB_TABLE) +
+            " WHERE client_id = %s AND is_active IS TRUE LIMIT %s",
+            (client_id, MAX_LIST_ENTRIES),
+        )
+        rows = portal_db.rows(cur)
+    best = None
+    best_key = None
+    for row in rows:
+        score = 0
+        for chunk in str(row.get("keywords") or "").split(","):
+            keyword = _normalize_text(chunk)
+            if not keyword:
+                continue
+            if " " in keyword:
+                if keyword in normalized:
+                    score += 3
+            elif keyword in tokens:
+                score += 3
+        if score <= 0:
+            continue
+        row_lang = str(row.get("lang") or "auto").strip().lower() or "auto"
+        if want and row_lang == want:
+            tier = 0
+        elif row_lang == "auto":
+            tier = 1
+        else:
+            tier = 2
+        key = (score, -tier)
+        if best_key is None or key > best_key:
+            best_key = key
+            best = row
+    if best is None or best_key[0] < MIN_KEYWORD_SCORE:
+        return None
+    return best
 
 
 def match_knowledge_base(cur, client_id, message_text):
@@ -194,7 +285,16 @@ def maybe_auto_reply(client_id, conversation_id, contact_id, contact_name,
         )
         if portal_db.rows(cur):
             return  # we just answered this conversation — stay quiet
-        entry = match_knowledge_base(cur, client_id, message_text)
+        contact_lang = None
+        try:
+            import portal_contacts
+
+            contact_lang = portal_contacts.stored_language(
+                cur, client_id, external_user_id)
+        except Exception:
+            contact_lang = None
+        entry = match_knowledge_base_lang(
+            cur, client_id, message_text, contact_lang)
         if entry is None:
             return
         display_name = str(contact_name or "").strip()
@@ -227,16 +327,6 @@ def maybe_auto_reply(client_id, conversation_id, contact_id, contact_name,
             (entry.get("id"),),
         )
         return True
-        portal_db.log_action(
-            cur,
-            client_id,
-            "kb.auto_reply",
-            "system",
-            None,
-            conversation_id,
-            ("Instant answer sent: "
-             + str(entry.get("title") or ""))[:200],
-        )
     logger.info(
         "knowledge base auto-reply queued entry=%s conversation=%s client=%s",
         entry.get("id"),
@@ -254,6 +344,7 @@ def get_knowledge_base():
         portal_db.ensure_tables()
         conn = portal_db._conn()
         try:
+            _ensure_lang_column(conn)
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO " + portal_db._q(KB_SETTINGS_TABLE) +
@@ -269,7 +360,8 @@ def get_knowledge_base():
                 settings_rows = portal_db.rows(cur)
                 cur.execute(
                     "SELECT id, title, category, keywords, content,"
-                    " is_active, usage_count FROM " + portal_db._q(KB_TABLE) +
+                    " is_active, usage_count, lang FROM "
+                    + portal_db._q(KB_TABLE) +
                     " WHERE client_id = %s"
                     " ORDER BY updated_at DESC, id DESC LIMIT %s",
                     (principal["client_id"], MAX_LIST_ENTRIES),
@@ -301,14 +393,21 @@ def create_kb_entry():
         conn = portal_db._conn()
         try:
             with conn.cursor() as cur:
+                blocked = portal_plans.enforce(cur, principal["client_id"],
+                                               "kb_entries",
+                                               "Knowledge-base entry")
+                if blocked is not None:
+                    return blocked
                 cur.execute(
                     "INSERT INTO " + portal_db._q(KB_TABLE) +
-                    " (client_id, title, category, keywords, content, is_active)"
-                    " VALUES (%s, %s, %s, %s, %s, %s)"
+                    " (client_id, title, category, keywords, content,"
+                    " is_active, lang)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
                     " RETURNING id, title, category, keywords, content,"
-                    " is_active, usage_count",
+                    " is_active, usage_count, lang",
                     (principal["client_id"], fields["title"], fields["category"],
-                     fields["keywords"], fields["content"], fields["is_active"]),
+                     fields["keywords"], fields["content"], fields["is_active"],
+                     fields["lang"]),
                 )
                 created = portal_db.rows(cur)
             conn.commit()
@@ -371,12 +470,13 @@ def update_kb_entry(entry_id):
                 cur.execute(
                     "UPDATE " + portal_db._q(KB_TABLE) +
                     " SET title = %s, category = %s, keywords = %s,"
-                    " content = %s, is_active = %s, updated_at = NOW()"
+                    " content = %s, lang = %s, is_active = %s,"
+                    " updated_at = NOW()"
                     " WHERE id = %s AND client_id = %s"
                     " RETURNING id, title, category, keywords, content,"
-                    " is_active, usage_count",
+                    " is_active, usage_count, lang",
                     (fields["title"], fields["category"], fields["keywords"],
-                     fields["content"], fields["is_active"],
+                     fields["content"], fields["lang"], fields["is_active"],
                      entry_id, principal["client_id"]),
                 )
                 updated = portal_db.rows(cur)

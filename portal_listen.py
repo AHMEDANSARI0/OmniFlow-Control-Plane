@@ -13,6 +13,7 @@ from portal_auth import (
     ensure_human_principal,
 )
 import portal_db
+import portal_plans
 
 bp = Blueprint("portal_listen", __name__, url_prefix="/api/v1/portal")
 
@@ -144,6 +145,11 @@ def add_listen_rule():
                     return jsonify({"error": {"code": "bad_request",
                                               "message": "Max " + str(MAX_RULES)
                                                          + " keywords."}}), 400
+                blocked = portal_plans.enforce(cur, principal["client_id"],
+                                               "alert_rules",
+                                               "Keyword alert rule")
+                if blocked is not None:
+                    return blocked
                 cur.execute(
                     "INSERT INTO " + portal_db._q(RULES_TABLE) +
                     " (client_id, keyword, note) VALUES (%s, %s, %s)"

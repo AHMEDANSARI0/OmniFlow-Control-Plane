@@ -38,6 +38,8 @@ from portal_recovery import bp as portal_recovery_bp  # noqa: E402
 from portal_risk import bp as portal_risk_bp  # noqa: E402
 from portal_courier import bp as portal_courier_bp  # noqa: E402
 from portal_perf import bp as portal_perf_bp  # noqa: E402
+from portal_templates import bp as portal_templates_bp  # noqa: E402
+from portal_plans import bp as portal_plans_bp  # noqa: E402
 from portal_media import bp as portal_media_bp, connector_bp as portal_media_connector_bp  # noqa: E402
 from portal_analytics import bp as portal_analytics_bp  # noqa: E402
 from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
@@ -134,6 +136,8 @@ aux_app.register_blueprint(portal_risk_bp)
 aux_app.register_blueprint(portal_courier_bp)
 aux_app.register_blueprint(portal_media_bp)
 aux_app.register_blueprint(portal_perf_bp)
+aux_app.register_blueprint(portal_templates_bp)
+aux_app.register_blueprint(portal_plans_bp)
 aux_app.register_blueprint(portal_media_connector_bp)
 _install_obs(aux_app)
 
