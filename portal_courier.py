@@ -50,6 +50,7 @@ logger = logging.getLogger("omniflow.portal-courier")
 bp = Blueprint("portal_courier", __name__, url_prefix="/api/v1/portal")
 
 SETTINGS_TABLE = "portal_courier_settings"
+PROVIDERS_TABLE = "portal_courier_providers"
 BOOKINGS_TABLE = "portal_courier_bookings"
 
 HTTP_TIMEOUT = 25
@@ -277,12 +278,55 @@ def tcs_test(cfg: Dict[str, str]) -> Dict[str, Any]:
                                     + str(code) + ")."}
 
 
+PROVIDERS["generic"] = {
+    "label": "Custom courier",
+    "default_base": "",
+    "secret_label": "API secret (optional)",
+}
+
+
+def generic_headers(cfg: Dict[str, str]) -> Dict[str, str]:
+    return {"Content-Type": "application/json"}
+
+
+def generic_book(cfg: Dict[str, str], data: Dict[str, Any]) -> Dict[str, Any]:
+    """Custom couriers have no known booking shape - the owner books
+    in the courier's own portal and tracking stays manual."""
+    return {"ok": False,
+            "message": "The custom courier adapter is connectivity-only"
+                       " - bookings happen in the courier's own portal."}
+
+
+def generic_track(cfg: Dict[str, str], tracking_number: str) \
+        -> Dict[str, Any]:
+    return {"ok": False,
+            "message": "Tracking is not available for custom couriers"
+                       " without an integration."}
+
+
+def generic_test(cfg: Dict[str, str]) -> Dict[str, Any]:
+    if not cfg.get("base_url"):
+        return {"ok": False, "message": "Base URL is required."}
+    code, _body = _http_json(cfg["base_url"].rstrip("/") + "/", None,
+                             generic_headers(cfg), method="GET")
+    if 200 <= code < 500:
+        return {"ok": True,
+                "message": "Endpoint reachable - for custom couriers"
+                           " bookings stay in the courier's own portal."}
+    return {"ok": False,
+            "message": "Endpoint unreachable (status " + str(code) + ")."}
+
+
 PROVIDERS["leopards"]["book"] = leopards_book
 PROVIDERS["leopards"]["track"] = leopards_track
 PROVIDERS["leopards"]["test"] = leopards_test
 PROVIDERS["tcs"]["book"] = tcs_book
 PROVIDERS["tcs"]["track"] = tcs_track
 PROVIDERS["tcs"]["test"] = tcs_test
+PROVIDERS["generic"]["headers"] = generic_headers
+PROVIDERS["generic"]["book"] = generic_book
+PROVIDERS["generic"]["track"] = generic_track
+PROVIDERS["generic"]["test"] = generic_test
 
 
 def normalize_status(raw: str) -> str:
@@ -336,6 +380,23 @@ CREATE TABLE IF NOT EXISTS portal_courier_bookings (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_courier_bookings
   ON portal_courier_bookings (client_id, id DESC);
+CREATE TABLE IF NOT EXISTS portal_courier_providers (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  name TEXT NOT NULL,
+  adapter TEXT NOT NULL DEFAULT 'generic',
+  base_url TEXT NOT NULL DEFAULT '',
+  api_key TEXT NOT NULL DEFAULT '',
+  api_secret TEXT NOT NULL DEFAULT '',
+  booking_mode TEXT NOT NULL DEFAULT 'draft',
+  enabled BOOLEAN NOT NULL DEFAULT FALSE,
+  test_status TEXT NOT NULL DEFAULT '',
+  test_message TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_courier_providers
+  ON portal_courier_providers (client_id, id DESC);
 """
 
 
@@ -408,6 +469,34 @@ def _configured(settings: Dict[str, Any]) -> bool:
             and not settings["api_password"]:
         return False
     return True
+
+
+def _store_draft(cur, client_id: int,
+                 provider_row: Dict[str, Any],
+                 data: Dict[str, Any]) -> Tuple[Any, int]:
+    """Hybrid booking draft: store the parcel, let a human review
+    and confirm - nothing is sent to the courier yet."""
+    draft = dict(data)
+    draft["provider_id"] = int(provider_row["id"])
+    cur.execute(
+        "INSERT INTO " + portal_db._q(BOOKINGS_TABLE) +
+        " (client_id, contact_id, provider, status, cod_amount,"
+        " city, payload) VALUES (%s, %s, %s, 'draft', %s, %s,"
+        " CAST(%s AS JSONB)) RETURNING id",
+        (client_id, data["contact_id"], str(provider_row["name"])[:60],
+         data["cod_amount"], data["city"], json.dumps(draft)),
+    )
+    rows = portal_db.rows(cur)
+    booking_id = int(rows[0]["id"]) if rows else 0
+    portal_db.log_action(
+        cur, client_id, "courier.book.draft", "human",
+        data["contact_id"] or None, None,
+        "Draft " + str(booking_id) + " queued via "
+        + str(provider_row["name"]) + " - awaiting confirm",
+    )
+    return jsonify({"ok": True, "draft": True, "id": booking_id,
+                    "provider": provider_row["name"],
+                    "message": "Draft stored - confirm to book."}), 200
 
 
 # ---------------------------------------------------------------------------
@@ -559,30 +648,84 @@ def book_courier_parcel():
                                              " weight must be"
                                              " numbers."}}), 400
     intel = normalize_address(data["address"] + " " + data["city"])
+    confirm = bool(payload.get("confirm"))
     conn = portal_db._conn()
     try:
         with conn.cursor() as cur:
             _ensure_ddl(cur)
             settings = _load_settings(cur, client_id)
-        conn.commit()
-    finally:
-        conn.close()
-    if not settings["enabled"] or not _configured(settings):
-        return jsonify({"error": {"code": "not_configured",
-                                  "message": "Save the credentials and"
-                                             " enable the connector"
-                                             " first."}}), 409
-    entry = PROVIDERS.get(settings["provider"]) or PROVIDERS["leopards"]
-    result = entry["book"](_effective_cfg(settings), data)
-    if not result.get("ok"):
-        return jsonify({"error": {"code": "courier_error",
-                                  "message": result.get("message",
-                                                        "Booking failed.")}}), 502
-    booking_id = None
-    conn = portal_db._conn()
-    try:
-        with conn.cursor() as cur:
-            _ensure_ddl(cur)
+            provider_row = None
+            wanted = payload.get("provider_id")
+            if wanted:
+                try:
+                    provider_row = _load_provider(cur, client_id,
+                                                  int(wanted))
+                except (TypeError, ValueError):
+                    provider_row = None
+                if provider_row is None:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Provider not"
+                                                         " found."}}), 404
+                if not provider_row["enabled"]:
+                    return jsonify({"error": {"code": "not_configured",
+                                              "message": "Enable this"
+                                                         " provider"
+                                                         " first."}}), 409
+            if provider_row is None:
+                provider_row = _default_provider(cur, client_id)
+            if provider_row is not None:
+                if not _provider_configured(provider_row):
+                    return jsonify({"error": {"code": "not_configured",
+                                              "message": "Save the API"
+                                                         " credentials"
+                                                         " for this"
+                                                         " provider"
+                                                         " first."}}), 409
+                mode = str(provider_row["booking_mode"] or "draft")
+                if mode == "draft" and not confirm:
+                    response = _store_draft(cur, client_id,
+                                            provider_row, data)
+                    conn.commit()
+                    return response
+                if mode == "manual" and not confirm:
+                    return jsonify({"error": {"code": "confirm_required",
+                                              "message": "Manual mode -"
+                                                         " booking needs"
+                                                         " an explicit"
+                                                         " human"
+                                                         " confirm."}}), 409
+                adapter = provider_row["adapter"]
+                cfg = _provider_cfg(provider_row)
+                provider_label = str(provider_row["name"])[:60]
+            elif settings["enabled"] and _configured(settings):
+                entry = PROVIDERS.get(settings["provider"]) \
+                    or PROVIDERS["leopards"]
+                adapter = settings["provider"]
+                cfg = _effective_cfg(settings)
+                provider_label = adapter
+                result = entry["book"](cfg, data)
+                if not result.get("ok"):
+                    return jsonify({"error": {"code": "courier_error",
+                                              "message": result.get(
+                                                  "message",
+                                                  "Booking"
+                                                  " failed.")}}), 502
+            else:
+                return jsonify({"error": {"code": "not_configured",
+                                          "message": "Add a courier"
+                                                     " provider and run"
+                                                     " its test"
+                                                     " first."}}), 409
+            if provider_row is not None:
+                entry = PROVIDERS.get(adapter) or PROVIDERS["generic"]
+                result = entry["book"](cfg, data)
+                if not result.get("ok"):
+                    return jsonify({"error": {"code": "courier_error",
+                                              "message": result.get(
+                                                  "message",
+                                                  "Booking"
+                                                  " failed.")}}), 502
+            booking_id = None
             cur.execute(
                 "INSERT INTO " + portal_db._q(BOOKINGS_TABLE) +
                 " (client_id, contact_id, tracking_number, provider,"
@@ -590,7 +733,7 @@ def book_courier_parcel():
                 " VALUES (%s, %s, %s, %s, 'booked', %s, %s,"
                 " CAST(%s AS JSONB)) RETURNING id",
                 (client_id, data["contact_id"],
-                 result["tracking_number"], settings["provider"],
+                 result["tracking_number"], provider_label,
                  data["cod_amount"], data["city"],
                  json.dumps({k: v for k, v in data.items()})),
             )
@@ -725,3 +868,379 @@ def track_courier_parcel():
                     "status": new_status,
                     "raw_status": result.get("status") or "",
                     "events": events}), 200
+
+
+# ---------------------------------------------------------------------------
+# DB-backed provider registry (+ button UI) and hybrid booking
+# ---------------------------------------------------------------------------
+
+BOOKING_MODES = ("auto", "draft", "manual")
+PROVIDER_NAME_MAX = 60
+
+
+def _provider_public(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(row.get("id") or 0),
+        "name": str(row.get("name") or ""),
+        "adapter": str(row.get("adapter") or "generic"),
+        "base_url": str(row.get("base_url") or ""),
+        "api_key_masked": mask_secret(str(row.get("api_key") or "")),
+        "api_secret_masked": mask_secret(str(row.get("api_secret") or "")),
+        "booking_mode": str(row.get("booking_mode") or "draft"),
+        "enabled": bool(row.get("enabled")),
+        "test_status": str(row.get("test_status") or ""),
+        "test_message": str(row.get("test_message") or ""),
+        "created_at": str(row.get("created_at") or ""),
+    }
+
+
+def _provider_cfg(row: Dict[str, Any]) -> Dict[str, str]:
+    entry = PROVIDERS.get(row["adapter"]) or PROVIDERS["generic"]
+    return {"provider": row["adapter"],
+            "base_url": row["base_url"].strip() or entry["default_base"],
+            "api_key": row["api_key"],
+            "api_password": row["api_secret"],
+            "api_secret": row["api_secret"]}
+
+
+def _provider_configured(row: Dict[str, Any]) -> bool:
+    if row["adapter"] == "leopards":
+        return bool(row["api_key"] and row["api_secret"])
+    if row["adapter"] == "tcs":
+        return bool(row["api_key"])
+    return bool(row["base_url"])
+
+
+def _load_provider(cur, client_id: int, provider_id: int) \
+        -> Optional[Dict[str, Any]]:
+    cur.execute(
+        "SELECT id, name, adapter, base_url, api_key, api_secret,"
+        " booking_mode, enabled, test_status, test_message, created_at"
+        " FROM " + portal_db._q(PROVIDERS_TABLE) +
+        " WHERE client_id = %s AND id = %s LIMIT 1",
+        (client_id, provider_id),
+    )
+    rows = portal_db.rows(cur)
+    return rows[0] if rows else None
+
+
+def _default_provider(cur, client_id: int) -> Optional[Dict[str, Any]]:
+    """Latest enabled, tested-OK provider wins; falls back to the
+    latest enabled one."""
+    cur.execute(
+        "SELECT id, name, adapter, base_url, api_key, api_secret,"
+        " booking_mode, enabled, test_status, test_message, created_at"
+        " FROM " + portal_db._q(PROVIDERS_TABLE) +
+        " WHERE client_id = %s AND enabled = TRUE"
+        " ORDER BY (test_status = 'ok') DESC, id DESC LIMIT 1",
+        (client_id,),
+    )
+    rows = portal_db.rows(cur)
+    return rows[0] if rows else None
+
+
+def _validate_provider_payload(payload: Dict[str, Any],
+                               partial: bool = False) \
+        -> Tuple[Optional[Dict[str, Any]], Optional[Tuple[Any, int]]]:
+    data: Dict[str, Any] = {}
+    if "name" in payload or not partial:
+        name = str(payload.get("name") or "").strip()[:PROVIDER_NAME_MAX]
+        if not name:
+            return None, (jsonify({"error": {"code": "bad_request",
+                                             "message": "name is"
+                                                        " required."}}), 400)
+        data["name"] = name
+    if "adapter" in payload or not partial:
+        adapter = str(payload.get("adapter") or "generic").strip().lower()
+        if adapter not in PROVIDERS:
+            return None, (jsonify({"error": {"code": "bad_request",
+                                             "message": "adapter must be"
+                                                        " one of: "
+                                                        + ", ".join(sorted(PROVIDERS)) + "."}}), 400)
+        data["adapter"] = adapter
+    if "base_url" in payload or not partial:
+        data["base_url"] = str(payload.get("base_url")
+                               or "").strip()[:300]
+    if "api_key" in payload:
+        data["api_key"] = str(payload.get("api_key") or "").strip()[:200]
+    if "api_secret" in payload:
+        data["api_secret"] = str(payload.get("api_secret")
+                                 or "").strip()[:200]
+    if "booking_mode" in payload or not partial:
+        mode = str(payload.get("booking_mode")
+                   or "draft").strip().lower()
+        if mode not in BOOKING_MODES:
+            return None, (jsonify({"error": {"code": "bad_request",
+                                             "message": "booking_mode"
+                                                        " must be one of: "
+                                                        + ", ".join(BOOKING_MODES)
+                                                        + "."}}), 400)
+        data["booking_mode"] = mode
+    if "enabled" in payload:
+        data["enabled"] = bool(payload.get("enabled"))
+    if "test_status" in payload:
+        data["test_status"] = ""
+        data["test_message"] = ""
+    return data, None
+
+
+@bp.get("/courier/providers")
+def list_courier_providers():
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            cur.execute(
+                "SELECT id, name, adapter, base_url, api_key, api_secret,"
+                " booking_mode, enabled, test_status, test_message,"
+                " created_at FROM " + portal_db._q(PROVIDERS_TABLE) +
+                " WHERE client_id = %s ORDER BY id DESC LIMIT 100",
+                (int(principal["client_id"]),),
+            )
+            rows = portal_db.rows(cur)
+        conn.commit()
+    finally:
+        conn.close()
+    adapters = [{"key": key, "label": entry["label"],
+                 "default_base": entry["default_base"],
+                 "secret_label": entry["secret_label"]}
+                for key, entry in sorted(PROVIDERS.items())]
+    return jsonify({"providers": [_provider_public(r) for r in rows],
+                    "adapters": adapters,
+                    "booking_modes": list(BOOKING_MODES)}), 200
+
+
+@bp.post("/courier/providers")
+def create_courier_provider():
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    payload = request.get_json(silent=True) or {}
+    data, error = _validate_provider_payload(payload)
+    if error:
+        return error
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            cur.execute(
+                "INSERT INTO " + portal_db._q(PROVIDERS_TABLE) +
+                " (client_id, name, adapter, base_url, api_key,"
+                " api_secret, booking_mode, enabled)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                (int(principal["client_id"]), data["name"],
+                 data["adapter"], data.get("base_url", ""),
+                 data.get("api_key", ""), data.get("api_secret", ""),
+                 data["booking_mode"], bool(data.get("enabled"))),
+            )
+            rows = portal_db.rows(cur)
+            provider_id = int(rows[0]["id"]) if rows else 0
+            portal_db.log_action(
+                cur, int(principal["client_id"]), "courier.provider.add",
+                "human", None, None,
+                "Provider " + data["name"] + " (" + data["adapter"] + ")",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "id": provider_id}), 201
+
+
+@bp.patch("/courier/providers/<int:provider_id>")
+def update_courier_provider(provider_id: int):
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal["client_id"])
+    payload = request.get_json(silent=True) or {}
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            row = _load_provider(cur, client_id, provider_id)
+            if row is None:
+                return jsonify({"error": {"code": "not_found",
+                                          "message": "Provider not"
+                                                     " found."}}), 404
+            data, error = _validate_provider_payload(payload,
+                                                     partial=True)
+            if error:
+                return error
+            if not data:
+                return jsonify({"error": {"code": "bad_request",
+                                          "message": "Nothing to"
+                                                     " update."}}), 400
+            sets = ", ".join(key + " = %s" for key in data)
+            cur.execute(
+                "UPDATE " + portal_db._q(PROVIDERS_TABLE) + " SET "
+                + sets + ", updated_at = NOW() WHERE client_id = %s"
+                " AND id = %s",
+                tuple(data.values()) + (client_id, provider_id),
+            )
+            portal_db.log_action(
+                cur, client_id, "courier.provider.update", "human",
+                None, None,
+                "Provider " + str(row["name"]) + " updated ("
+                + ", ".join(sorted(data)) + ")",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True}), 200
+
+
+@bp.delete("/courier/providers/<int:provider_id>")
+def delete_courier_provider(provider_id: int):
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal["client_id"])
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            row = _load_provider(cur, client_id, provider_id)
+            if row is None:
+                return jsonify({"error": {"code": "not_found",
+                                          "message": "Provider not"
+                                                     " found."}}), 404
+            cur.execute(
+                "DELETE FROM " + portal_db._q(PROVIDERS_TABLE) +
+                " WHERE client_id = %s AND id = %s",
+                (client_id, provider_id),
+            )
+            portal_db.log_action(
+                cur, client_id, "courier.provider.delete", "human",
+                None, None, "Provider " + str(row["name"]) + " removed",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True}), 200
+
+
+@bp.post("/courier/providers/<int:provider_id>/test")
+def test_courier_provider(provider_id: int):
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal["client_id"])
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            row = _load_provider(cur, client_id, provider_id)
+            if row is None:
+                return jsonify({"error": {"code": "not_found",
+                                          "message": "Provider not"
+                                                     " found."}}), 404
+            if not _provider_configured(row):
+                return jsonify({"error": {"code": "not_configured",
+                                          "message": "Save the API"
+                                                     " credentials for"
+                                                     " this provider"
+                                                     " first."}}), 409
+            entry = PROVIDERS.get(row["adapter"]) or PROVIDERS["generic"]
+            result = entry["test"](_provider_cfg(row))
+            cur.execute(
+                "UPDATE " + portal_db._q(PROVIDERS_TABLE) +
+                " SET test_status = %s, test_message = %s,"
+                " updated_at = NOW() WHERE client_id = %s AND id = %s",
+                ("ok" if result.get("ok") else "fail",
+                 str(result.get("message") or "")[:300],
+                 client_id, provider_id),
+            )
+            portal_db.log_action(
+                cur, client_id, "courier.provider.test", "human",
+                None, None,
+                "Test " + ("passed" if result.get("ok") else "failed")
+                + " for " + str(row["name"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": bool(result.get("ok")),
+                    "message": str(result.get("message") or "")}), 200
+
+
+@bp.post("/courier/bookings/<int:booking_id>/confirm")
+def confirm_courier_booking(booking_id: int):
+    """Human confirm step of hybrid booking: takes a stored draft,
+    books it with the provider and flips it to 'booked'."""
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal["client_id"])
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            cur.execute(
+                "SELECT id, contact_id, provider, status, cod_amount,"
+                " city, payload FROM " + portal_db._q(BOOKINGS_TABLE) +
+                " WHERE client_id = %s AND id = %s LIMIT 1",
+                (client_id, booking_id),
+            )
+            rows = portal_db.rows(cur)
+            if not rows:
+                return jsonify({"error": {"code": "not_found",
+                                          "message": "Booking not"
+                                                     " found."}}), 404
+            booking = rows[0]
+            if str(booking.get("status")) != "draft":
+                return jsonify({"error": {"code": "bad_request",
+                                          "message": "Only draft"
+                                                     " bookings can be"
+                                                     " confirmed."}}), 409
+            draft = booking.get("payload")
+            if not isinstance(draft, dict):
+                draft = {}
+            provider_row = None
+            draft_pid = draft.get("provider_id")
+            if draft_pid:
+                try:
+                    provider_row = _load_provider(cur, client_id,
+                                                  int(draft_pid))
+                except (TypeError, ValueError):
+                    provider_row = None
+            if provider_row is None:
+                provider_row = _default_provider(cur, client_id)
+            if provider_row is None:
+                return jsonify({"error": {"code": "not_configured",
+                                          "message": "No enabled"
+                                                     " provider left -"
+                                                     " re-add one to"
+                                                     " confirm."}}), 409
+            entry = PROVIDERS.get(provider_row["adapter"]) \
+                or PROVIDERS["generic"]
+            data = {k: v for k, v in draft.items()
+                    if k != "provider_id"}
+            result = entry["book"](_provider_cfg(provider_row), data)
+            if not result.get("ok"):
+                return jsonify({"error": {"code": "courier_error",
+                                          "message": result.get(
+                                              "message",
+                                              "Booking failed.")}}), 502
+            cur.execute(
+                "UPDATE " + portal_db._q(BOOKINGS_TABLE) +
+                " SET tracking_number = %s, provider = %s,"
+                " status = 'booked', updated_at = NOW()"
+                " WHERE client_id = %s AND id = %s",
+                (result["tracking_number"],
+                 str(provider_row["name"])[:60], client_id, booking_id),
+            )
+            portal_db.log_action(
+                cur, client_id, "courier.book.confirm", "human",
+                str(booking.get("contact_id") or "") or None, None,
+                "Draft " + str(booking_id) + " confirmed as "
+                + result["tracking_number"] + " via "
+                + str(provider_row["name"]),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True, "id": booking_id,
+                    "tracking_number": result["tracking_number"]}), 200

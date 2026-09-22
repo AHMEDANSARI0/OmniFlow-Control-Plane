@@ -13,7 +13,9 @@ from portal_auth import (
     ensure_human_principal,
 )
 import portal_checkout
+import portal_courier
 import portal_db
+import portal_recovery
 
 bp = Blueprint("portal_analytics", __name__, url_prefix="/api/v1/portal")
 logger = logging.getLogger(__name__)
@@ -81,6 +83,17 @@ def customer_analytics():
             portal_checkout._ensure_checkout_tables(conn)
             with conn.cursor() as cur:
                 rows = _fetch_paid_links(cur, principal["client_id"], days)
+                try:
+                    cur.execute(
+                        "SELECT lang, COUNT(*) AS n FROM "
+                        + portal_db._q("portal_contact_lang") +
+                        " WHERE client_id = %s"
+                        " GROUP BY lang ORDER BY n DESC LIMIT 6",
+                        (principal["client_id"],),
+                    )
+                    lang_rows = portal_db.rows(cur)
+                except Exception:
+                    lang_rows = []
         finally:
             conn.close()
     except Exception as error:
@@ -114,6 +127,10 @@ def customer_analytics():
     for entry in customers:
         tiers[entry["tier"]] += 1
     return jsonify({"days": days, "customers": customers[:50],
+                    "languages": [
+                        {"lang": str(row.get("lang") or ""),
+                         "count": int(row.get("n") or 0)}
+                        for row in lang_rows],
                     "tiers": tiers,
                     "repeat_share": round(
                         (tiers["repeat"] + tiers["vip"])
@@ -161,3 +178,99 @@ def product_analytics():
     products = sorted(by_product.values(),
                       key=lambda e: (-e["revenue"], e["name"]))[:50]
     return jsonify({"days": days, "products": products}), 200
+
+
+def _count(cur, sql: str, args: tuple) -> int:
+    cur.execute(sql, args)
+    row = portal_db.rows(cur)
+    return int((row[0].get("n") or 0)) if row else 0
+
+
+def _fetch_operations(cur, client_id: int, days: int) -> Dict[str, Any]:
+    """Six tiny indexed aggregates - the whole operations overview in
+    one round trip. Counts stay capped so a busy workspace cannot
+    make the dashboard wait."""
+    window = "created_at >= NOW() - (%s || ' days')::interval"
+    convs = portal_db._q(portal_db.CONV_TABLE)
+    msgs = portal_db._q(portal_db.MSGS_TABLE)
+    links = portal_db._q(portal_checkout.LINKS_TABLE)
+    queue = portal_db._q(portal_recovery.QUEUE_TABLE)
+    bookings = portal_db._q(portal_courier.BOOKINGS_TABLE)
+    csat = portal_db._q(portal_db.CSAT_TABLE)
+    out: Dict[str, Any] = {"chats": {}, "messages": {}, "orders": {},
+                           "deliveries": {}, "recovery": {}, "csat": {}}
+    out["chats"]["new"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + convs
+        + " WHERE client_id = %s AND " + window),
+        (client_id, str(days)))
+    out["chats"]["open"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + convs
+        + " WHERE client_id = %s AND status = 'open'"), (client_id,))
+    out["chats"]["total"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + convs
+        + " WHERE client_id = %s"), (client_id,))
+    out["messages"]["received"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + msgs
+        + " WHERE client_id = %s AND direction = 'in' AND " + window),
+        (client_id, str(days)))
+    out["messages"]["sent"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + msgs
+        + " WHERE client_id = %s AND direction = 'out' AND " + window),
+        (client_id, str(days)))
+    cur.execute("SELECT COUNT(*) AS n,"
+                " COALESCE(SUM(paid_amount), 0) AS revenue FROM " + links
+                + " WHERE client_id = %s AND status IN"
+                " ('paid', 'shipped', 'delivered') AND " + window,
+                (client_id, str(days)))
+    paid = portal_db.rows(cur)
+    out["orders"]["paid"] = int(paid[0]["n"]) if paid else 0
+    out["orders"]["revenue"] = float(paid[0]["revenue"]) if paid else 0.0
+    out["deliveries"]["bookings"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + bookings
+        + " WHERE client_id = %s AND " + window), (client_id, str(days)))
+    cur.execute("SELECT status, COUNT(*) AS n FROM " + bookings
+                + " WHERE client_id = %s GROUP BY status", (client_id,))
+    by_status: Dict[str, int] = {}
+    for row in portal_db.rows(cur)[:20]:
+        status = str(row.get("status") or "unknown")
+        by_status[status] = int(row.get("n") or 0)
+    out["deliveries"]["by_status"] = by_status
+    out["recovery"]["open"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + queue
+        + " WHERE client_id = %s AND status = 'open'"), (client_id,))
+    out["recovery"]["resolved"] = _count(cur, (
+        "SELECT COUNT(*) AS n FROM " + queue
+        + " WHERE client_id = %s AND status = 'resolved' AND " + window),
+        (client_id, str(days)))
+    cur.execute("SELECT AVG(score) AS avg_score, COUNT(*) AS n FROM "
+                + csat + " WHERE client_id = %s AND score IS NOT NULL"
+                " AND answered_at IS NOT NULL AND answered_at >= NOW()"
+                " - (%s || ' days')::interval", (client_id, str(days)))
+    csat_rows = portal_db.rows(cur)
+    score = csat_rows[0].get("avg_score") if csat_rows else None
+    out["csat"]["answers"] = int(csat_rows[0]["n"]) if csat_rows else 0
+    out["csat"]["avg_score"] = round(float(score), 2) if score is not None else None
+    return out
+
+
+@bp.get("/insights/operations")
+def operations_analytics():
+    """Consolidated operations snapshot: chats, messages, orders,
+    deliveries, recovery and CSAT for the dashboard overview."""
+    principal, error = _principal_or_error()
+    if error:
+        return error
+    days = _parse_days(request.args.get("days"))
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                data = _fetch_operations(cur, principal["client_id"], days)
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("operations analytics failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "operations analytics")[0]), 503
+    return jsonify({"days": days, "operations": data}), 200
