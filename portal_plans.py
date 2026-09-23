@@ -40,6 +40,7 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "kb_entries": None,
             "alert_rules": None,
             "courier_providers": None,
+            "brands": None,
         },
     },
     "free": {
@@ -51,6 +52,7 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "kb_entries": 20,
             "alert_rules": 5,
             "courier_providers": 1,
+            "brands": 1,
         },
     },
     "growth": {
@@ -62,6 +64,7 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "kb_entries": 100,
             "alert_rules": 25,
             "courier_providers": 3,
+            "brands": 5,
         },
     },
     "pro": {
@@ -73,6 +76,7 @@ PLANS: Dict[str, Dict[str, Any]] = {
             "kb_entries": None,
             "alert_rules": None,
             "courier_providers": None,
+            "brands": None,
         },
     },
 }
@@ -136,7 +140,7 @@ def _count(cur, sql: str, args: tuple) -> int:
 
 
 def _usage(cur, client_id: int) -> Dict[str, int]:
-    """Five live counters - one indexed query each."""
+    """Live counters - one indexed query each."""
     return {
         "broadcasts_per_month": _count(
             cur,
@@ -160,6 +164,10 @@ def _usage(cur, client_id: int) -> Dict[str, int]:
         "courier_providers": _count(
             cur,
             "SELECT COUNT(*) AS n FROM portal_courier_providers"
+            " WHERE client_id = %s", (client_id,)),
+        "brands": _count(
+            cur,
+            "SELECT COUNT(*) AS n FROM portal_brands"
             " WHERE client_id = %s", (client_id,)),
     }
 

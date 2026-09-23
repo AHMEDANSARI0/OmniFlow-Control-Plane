@@ -29,6 +29,8 @@ public_bp = Blueprint("portal_checkout_public", __name__,
 @public_bp.get("/checkout/<token>")
 def public_checkout_route(token: str):
     payload, status = public_checkout(token)
+    if status == 200 and isinstance(payload, dict):
+        payload["phone_verification"] = phone_verification_on()
     return jsonify(payload), status
 
 logger = logging.getLogger(__name__)
@@ -68,6 +70,44 @@ MAX_ITEMS = 20
 MAX_QTY = 99
 MAX_TITLE = 120
 MONEY_ROLES = ("owner", "admin")
+OTP_TABLE = "portal_checkout_otps"
+OTP_TTL_MINUTES = 10
+OTP_MAX_SENDS = 3
+OTP_MAX_ATTEMPTS = 5
+_OTP_DDL_READY = False
+
+
+def _ensure_otp_table(conn) -> None:
+    """portal_checkout_otps lands lazily (phone verification at pay)."""
+    global _OTP_DDL_READY
+    if _OTP_DDL_READY:
+        return
+    with conn.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS " + portal_db._q(OTP_TABLE) + " ("
+            " token TEXT PRIMARY KEY,"
+            " client_id BIGINT NOT NULL,"
+            " contact_id TEXT NOT NULL,"
+            " code_hash TEXT NOT NULL,"
+            " attempts INT NOT NULL DEFAULT 0,"
+            " created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+            ")"
+        )
+    _OTP_DDL_READY = True
+
+
+def _otp_hash(token: str, code: str) -> str:
+    import hashlib
+    return hashlib.sha256((token + ":" + code).encode("utf8")).hexdigest()
+
+
+def phone_verification_on() -> bool:
+    """The platform switch (admin panel), fail-soft off."""
+    try:
+        import platform_settings
+        return platform_settings.flag("phone_verification")
+    except Exception:
+        return False
 
 
 def ensure_money_principal(principal: Dict[str, Any],
@@ -139,7 +179,12 @@ def _ensure_checkout_tables(conn) -> None:
             " ADD COLUMN IF NOT EXISTS tracking_number"
             " TEXT NOT NULL DEFAULT '',"
             " ADD COLUMN IF NOT EXISTS advance_percent"
-            " INTEGER NOT NULL DEFAULT 0"
+            " INTEGER NOT NULL DEFAULT 0,"
+            " ADD COLUMN IF NOT EXISTS brand_id BIGINT"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS portal_checkout_brand_idx ON "
+            + portal_db._q(LINKS_TABLE) + " (client_id, brand_id)"
         )
     conn.commit()
     _CHECKOUT_DDL_READY = True
@@ -484,6 +529,9 @@ def _public(row: Dict[str, Any]) -> Dict[str, Any]:
         "tracking_number": str(row.get("tracking_number") or ""),
         "paid_amount": round(float(row.get("paid_amount") or 0), 2),
         "advance_percent": int(row.get("advance_percent") or 0),
+        "brand_id": (int(row["brand_id"]) if row.get("brand_id") else None),
+        "brand_name": (str(row["brand_name"])
+                       if row.get("brand_name") else None),
         "advance_due": _advance_due(row),
         "cod_balance": _cod_balance(row),
         "due": max(
@@ -561,19 +609,24 @@ def create_checkout_link():
         try:
             _ensure_checkout_tables(conn)
             with conn.cursor() as cur:
+                import portal_brands
+
+                brand_id = portal_brands.resolve_brand(
+                    cur, principal["client_id"],
+                    payload.get("brand_id"))
                 cur.execute(
                     "INSERT INTO " + portal_db._q(LINKS_TABLE) +
                     " (client_id, contact_id, token, title, items, total,"
-                    " discount, expires_at, advance_percent)"
+                    " discount, expires_at, advance_percent, brand_id)"
                     " VALUES (%s, %s, %s, %s, CAST(%s AS JSONB), %s, %s,"
                     " CASE WHEN %s IS NULL THEN NULL"
-                    " ELSE NOW() + (%s * INTERVAL '1 day') END, %s)"
+                    " ELSE NOW() + (%s * INTERVAL '1 day') END, %s, %s)"
                     " RETURNING id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"
-                    " paid_amount, advance_percent",
+                    " paid_amount, advance_percent, brand_id",
                     (principal["client_id"], contact, token, title,
                      json.dumps(items), total, discount_amount,
-                     expires_days, expires_days, advance_percent),
+                     expires_days, expires_days, advance_percent, brand_id),
                 )
                 created = portal_db.rows(cur)
                 portal_db.log_action(
@@ -607,14 +660,32 @@ def list_checkout_links():
         try:
             _ensure_checkout_tables(conn)
             with conn.cursor() as cur:
+                brand_filter = request.args.get("brand_id")
+                brand_join = ""
+                brand_where = ""
+                list_args = [principal["client_id"]]
+                if brand_filter not in (None, "", "all"):
+                    brand_where = " AND " + portal_db._q(LINKS_TABLE) \
+                        + ".brand_id = %s"
+                    list_args.append(int(brand_filter))
+                if brand_filter is None:
+                    brand_join = (" LEFT JOIN portal_brands ON"
+                                  " portal_brands.id = "
+                                  + portal_db._q(LINKS_TABLE) + ".brand_id")
                 cur.execute(
-                    "SELECT id, token, contact_id, title, items, total,"
+                    "SELECT " + portal_db._q(LINKS_TABLE) +
+                    ".id, token, contact_id, title, items, total,"
                     " status, created_at, expires_at, view_count, discount,"
                     " courier, tracking_number, coupon_code,"
-                    " coupon_discount, paid_amount, advance_percent"
-                    " FROM " + portal_db._q(LINKS_TABLE) +
-                    " WHERE client_id = %s ORDER BY id DESC LIMIT 30",
-                    (principal["client_id"],),
+                    " coupon_discount, paid_amount, advance_percent,"
+                    + portal_db._q(LINKS_TABLE) +
+                    ".brand_id, portal_brands.name AS brand_name"
+                    " FROM " + portal_db._q(LINKS_TABLE) + brand_join +
+                    " WHERE " + portal_db._q(LINKS_TABLE) +
+                    ".client_id = %s" + brand_where +
+                    " ORDER BY " + portal_db._q(LINKS_TABLE) +
+                    ".id DESC LIMIT 30",
+                    tuple(list_args),
                 )
                 rows = portal_db.rows(cur)
         finally:
@@ -1343,12 +1414,15 @@ def public_checkout(token: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]
                 except Exception:
                     pass
                 cur.execute(
-                    "SELECT id, token, contact_id, title, items, total,"
-                    " status, created_at, expires_at, view_count, discount,"
-                    " courier, tracking_number, coupon_code,"
-                    " coupon_discount, paid_amount, advance_percent"
-                    " FROM " + portal_db._q(LINKS_TABLE) +
-                    " WHERE token = %s LIMIT 1",
+                    "SELECT l.id, l.token, l.contact_id, l.title, l.items,"
+                    " l.total, l.status, l.created_at, l.expires_at,"
+                    " l.view_count, l.discount, l.courier,"
+                    " l.tracking_number, l.coupon_code, l.coupon_discount,"
+                    " l.paid_amount, l.advance_percent, l.brand_id,"
+                    " b.name AS brand_name"
+                    " FROM " + portal_db._q(LINKS_TABLE) + " l"
+                    " LEFT JOIN portal_brands b ON b.id = l.brand_id"
+                    " WHERE l.token = %s LIMIT 1",
                     (token,),
                 )
                 rows = portal_db.rows(cur)
@@ -1490,3 +1564,149 @@ def returns_export():
         headers={"Content-Disposition":
                  "attachment; filename=omniflow-returns.csv"},
     )
+
+
+@public_bp.post("/checkout/<token>/otp")
+def public_checkout_otp(token: str):
+    """Send the order-verification code to the customer on WhatsApp."""
+    if not phone_verification_on():
+        return jsonify({"error": {"code": "feature_off",
+                                  "message": "Phone verification is not"
+                                             " enabled."}}), 409
+    token = str(token or "").strip()[:64]
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_checkout_tables(conn)
+            _ensure_otp_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, client_id, contact_id, status FROM "
+                    + portal_db._q(LINKS_TABLE) +
+                    " WHERE token = %s LIMIT 1",
+                    (token,),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "This order link"
+                                                         " is not"
+                                                         " valid."}}), 404
+                link = rows[0]
+                if (link.get("status") or "open") != "open":
+                    return jsonify({"error": {"code": "bad_request",
+                                              "message": "This order is"
+                                                         " already"
+                                                         " settled."}}), 400
+                contact_id = str(link.get("contact_id") or "")
+                if not contact_id:
+                    return jsonify({"error": {"code": "bad_request",
+                                              "message": "This order has"
+                                                         " no customer"
+                                                         " contact."}}), 400
+                cur.execute(
+                    "SELECT COUNT(*) AS n FROM " + portal_db._q(OTP_TABLE)
+                    + " WHERE token = %s AND created_at > NOW()"
+                    " - INTERVAL '15 minutes'", (token,),
+                )
+                recent = int(portal_db.rows(cur)[0]["n"])
+                if recent >= OTP_MAX_SENDS:
+                    return jsonify({"error": {"code": "rate_limited",
+                                              "message": "Too many codes"
+                                                         " - wait a few"
+                                                         " minutes."}}), 429
+                code = "".join(str(secrets.randbelow(10))
+                               for _ in range(6))
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(OTP_TABLE) +
+                    " (token, client_id, contact_id, code_hash, attempts,"
+                    " created_at) VALUES (%s, %s, %s, %s, 0, NOW())"
+                    " ON CONFLICT (token) DO UPDATE SET code_hash ="
+                    " EXCLUDED.code_hash, attempts = 0, created_at ="
+                    " NOW()",
+                    (token, link.get("client_id"), contact_id,
+                     _otp_hash(token, code)),
+                )
+                name = _contact_name(cur, link.get("client_id"),
+                                     contact_id)
+                portal_growth._send_command(
+                    cur, link.get("client_id"), contact_id, name,
+                    "Your verification code is " + code
+                    + " (valid " + str(OTP_TTL_MINUTES)
+                    + " minutes). Do not share it.",
+                    "phone_otp",
+                )
+                portal_db.log_action(
+                    cur, link.get("client_id"), "checkout.otp_sent",
+                    "system", None, None,
+                    ("Phone OTP sent for link token "
+                     + token[:8])[:200],
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("checkout otp send failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "phone verification")[0]), 503
+    return jsonify({"ok": True, "sent": True}), 200
+
+
+@public_bp.post("/checkout/<token>/otp/verify")
+def public_checkout_otp_verify(token: str):
+    """Verify the code the customer typed (attempts capped)."""
+    if not phone_verification_on():
+        return jsonify({"error": {"code": "feature_off",
+                                  "message": "Phone verification is not"
+                                             " enabled."}}), 409
+    token = str(token or "").strip()[:64]
+    payload = request.get_json(silent=True) or {}
+    code = str(payload.get("code") or "").strip()
+    if not code.isdigit() or len(code) != 6:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Enter the 6-digit code."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_otp_table(conn)
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT code_hash, attempts, created_at FROM "
+                    + portal_db._q(OTP_TABLE) +
+                    " WHERE token = %s LIMIT 1", (token,),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    return jsonify({"error": {"code": "not_found",
+                                              "message": "Request a code"
+                                                         " first."}}), 404
+                row = rows[0]
+                if int(row.get("attempts") or 0) >= OTP_MAX_ATTEMPTS:
+                    return jsonify({"error": {"code": "rate_limited",
+                                              "message": "Too many tries"
+                                                         " - request a new"
+                                                         " code."}}), 429
+                cur.execute(
+                    "UPDATE " + portal_db._q(OTP_TABLE) +
+                    " SET attempts = attempts + 1 WHERE token = %s",
+                    (token,),
+                )
+                valid = (
+                    _otp_hash(token, code) == str(row.get("code_hash"))
+                    and str(row.get("created_at")) != ""
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("checkout otp verify failed: %s", error)
+        return jsonify(portal_db.portal_unavailable(
+            error, "phone verification")[0]), 503
+    if not valid:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "That code is not right -"
+                                             " check the WhatsApp"
+                                             " message."}}), 400
+    return jsonify({"ok": True, "verified": True}), 200

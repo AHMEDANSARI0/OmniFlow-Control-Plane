@@ -44,13 +44,32 @@ def _http_post_json(url: str, headers: Dict[str, str],
         return None
 
 
+def _runtime() -> Dict[str, Any]:
+    """Effective config: admin panel first, env fallback (fail-soft)."""
+    try:
+        import platform_settings
+        config = platform_settings.llm_config()
+        if config.get("enabled") and config.get("api_key"):
+            return config
+        if not ENABLED:
+            return {"base_url": BASE_URL, "api_key": "", "model": MODEL,
+                    "enabled": False}
+        if config.get("api_key"):
+            return config
+    except Exception:
+        pass
+    return {"base_url": BASE_URL, "api_key": API_KEY, "model": MODEL,
+            "enabled": bool(ENABLED and API_KEY)}
+
+
 def chat_json(system: str, user: str,
               max_tokens: int = 120) -> Optional[Dict[str, Any]]:
     """One JSON-mode chat call; parsed object or None (never raises)."""
-    if not ENABLED or not API_KEY:
+    runtime = _runtime()
+    if not runtime.get("enabled") or not runtime.get("api_key"):
         return None
     payload = {
-        "model": MODEL,
+        "model": runtime.get("model") or MODEL,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user},
@@ -60,11 +79,12 @@ def chat_json(system: str, user: str,
         "response_format": {"type": "json_object"},
     }
     headers = {
-        "Authorization": "Bearer " + API_KEY,
+        "Authorization": "Bearer " + str(runtime["api_key"]),
         "Content-Type": "application/json",
     }
+    base = str(runtime.get("base_url") or BASE_URL).rstrip("/")
     for _ in range(ATTEMPTS):
-        data = _http_post_json(BASE_URL + "/chat/completions", headers, payload)
+        data = _http_post_json(base + "/chat/completions", headers, payload)
         if not data:
             continue
         try:

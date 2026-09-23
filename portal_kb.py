@@ -19,6 +19,7 @@ from flask import Blueprint, jsonify, request
 from portal_auth import PortalAuthUnavailable, authenticate_portal_request
 import portal_db
 import portal_plans
+import portal_brands
 
 
 logger = logging.getLogger("omniflow.portal-knowledge-base")
@@ -85,6 +86,30 @@ def _ensure_lang_column(conn) -> None:
             pass
 
 
+def _ensure_brand_column(conn) -> None:
+    """portal_kb_entries.brand_id lands lazily (multi-brand prep)."""
+    global _BRAND_DDL_READY
+    if _BRAND_DDL_READY:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "ALTER TABLE " + portal_db._q(KB_TABLE) +
+                " ADD COLUMN IF NOT EXISTS brand_id BIGINT"
+            )
+            cur.execute(
+                "CREATE INDEX IF NOT EXISTS portal_kb_brand_idx ON "
+                + portal_db._q(KB_TABLE) + " (client_id, brand_id)"
+            )
+        conn.commit()
+        _BRAND_DDL_READY = True
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
+
 def _principal_or_error():
     try:
         principal = authenticate_portal_request()
@@ -112,6 +137,7 @@ def _entry_json(row: Dict[str, Any]) -> Dict[str, Any]:
         "is_active": row.get("is_active") is True,
         "usage_count": int(row.get("usage_count") or 0),
         "lang": str(row.get("lang") or "auto"),
+        "brand_id": int(row["brand_id"]) if row.get("brand_id") else None,
     }
 
 
@@ -153,6 +179,7 @@ def _clean_entry_payload(raw):
         "category": category,
         "is_active": is_active,
         "lang": lang,
+        "brand_id": raw.get("brand_id"),
     }, None
 
 
@@ -345,6 +372,7 @@ def get_knowledge_base():
         conn = portal_db._conn()
         try:
             _ensure_lang_column(conn)
+            _ensure_brand_column(conn)
             with conn.cursor() as cur:
                 cur.execute(
                     "INSERT INTO " + portal_db._q(KB_SETTINGS_TABLE) +
@@ -358,13 +386,20 @@ def get_knowledge_base():
                     (principal["client_id"],),
                 )
                 settings_rows = portal_db.rows(cur)
+                brand_filter = request.args.get("brand_id")
+                brand_where = ""
+                list_args = [principal["client_id"]]
+                if brand_filter not in (None, "", "all"):
+                    brand_where = " AND brand_id = %s"
+                    list_args.append(int(brand_filter))
+                list_args.append(MAX_LIST_ENTRIES)
                 cur.execute(
                     "SELECT id, title, category, keywords, content,"
-                    " is_active, usage_count, lang FROM "
+                    " is_active, usage_count, lang, brand_id FROM "
                     + portal_db._q(KB_TABLE) +
-                    " WHERE client_id = %s"
+                    " WHERE client_id = %s" + brand_where +
                     " ORDER BY updated_at DESC, id DESC LIMIT %s",
-                    (principal["client_id"], MAX_LIST_ENTRIES),
+                    tuple(list_args),
                 )
                 entry_rows = portal_db.rows(cur)
             conn.commit()
@@ -392,22 +427,26 @@ def create_kb_entry():
         portal_db.ensure_tables()
         conn = portal_db._conn()
         try:
+            _ensure_brand_column(conn)
             with conn.cursor() as cur:
                 blocked = portal_plans.enforce(cur, principal["client_id"],
                                                "kb_entries",
                                                "Knowledge-base entry")
                 if blocked is not None:
                     return blocked
+                brand_id = portal_brands.resolve_brand(
+                    cur, principal["client_id"],
+                    (payload.get("entry") or {}).get("brand_id"))
                 cur.execute(
                     "INSERT INTO " + portal_db._q(KB_TABLE) +
                     " (client_id, title, category, keywords, content,"
-                    " is_active, lang)"
-                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " is_active, lang, brand_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s, %s)"
                     " RETURNING id, title, category, keywords, content,"
-                    " is_active, usage_count, lang",
+                    " is_active, usage_count, lang, brand_id",
                     (principal["client_id"], fields["title"], fields["category"],
                      fields["keywords"], fields["content"], fields["is_active"],
-                     fields["lang"]),
+                     fields["lang"], brand_id),
                 )
                 created = portal_db.rows(cur)
             conn.commit()
@@ -467,19 +506,22 @@ def update_kb_entry(entry_id):
         conn = portal_db._conn()
         try:
             with conn.cursor() as cur:
+                brand_id = portal_brands.resolve_brand(
+                    cur, principal["client_id"], fields.get("brand_id"))
                 cur.execute(
                     "UPDATE " + portal_db._q(KB_TABLE) +
                     " SET title = %s, category = %s, keywords = %s,"
                     " content = %s, lang = %s, is_active = %s,"
-                    " updated_at = NOW()"
+                    " brand_id = %s, updated_at = NOW()"
                     " WHERE id = %s AND client_id = %s"
                     " RETURNING id, title, category, keywords, content,"
-                    " is_active, usage_count, lang",
-                    (fields["title"], fields["category"], fields["keywords"],
-                     fields["content"], fields["lang"], fields["is_active"],
+                    " is_active, usage_count, lang, brand_id",
+                    (fields["title"], fields["category"],
+                     fields["keywords"], fields["content"],
+                     fields["lang"], fields["is_active"], brand_id,
                      entry_id, principal["client_id"]),
                 )
-                updated = portal_db.rows(cur)
+            updated = portal_db.rows(cur)
             conn.commit()
         finally:
             conn.close()

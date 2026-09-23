@@ -3,7 +3,6 @@
 import logging
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -12,6 +11,7 @@ from portal_auth import (
     authenticate_portal_request,
 )
 import portal_db
+from typing import Any, Dict
 
 bp = Blueprint("portal_insights", __name__, url_prefix="/api/v1/portal")
 
@@ -44,6 +44,45 @@ NEGATIVE_WORDS = (
     "problem", "masla", "issue", "hangama", "paisa wapas", "refund",
     "pathar", "nakli", "cheap",
 )
+
+
+def analyze_sentiment_smart(text: str) -> dict:
+    """LLM sentiment when the admin panel switch is on; lexicon fallback.
+
+    The owner decision lives in platform_settings (flags.true_sentiment);
+    any LLM trouble silently falls back to the deterministic lexicon so
+    the endpoint never breaks.
+    """
+    base = analyze_sentiment(text)
+    try:
+        import platform_settings
+        if not platform_settings.flag("true_sentiment"):
+            base["engine"] = "lexicon"
+            return base
+        import portal_llm
+        data = portal_llm.chat_json(
+            "Classify the customer's sentiment. Reply as JSON "
+            '{\"label\": \"positive|negative|mixed|neutral\", '
+            '\"score\": <-5..5>}.',
+            str(text or "")[:1000],
+            max_tokens=60,
+        )
+        if not isinstance(data, dict):
+            base["engine"] = "lexicon"
+            return base
+        label = str(data.get("label") or "").strip().lower()
+        if label not in ("positive", "negative", "mixed", "neutral"):
+            base["engine"] = "lexicon"
+            return base
+        try:
+            score = max(-5, min(5, int(data.get("score"))))
+        except Exception:
+            score = base["score"]
+        base.update({"label": label, "score": score, "engine": "llm"})
+        return base
+    except Exception:
+        base["engine"] = "lexicon"
+        return base
 
 
 def analyze_sentiment(text: str) -> dict:
@@ -127,7 +166,7 @@ def sentiment_endpoint():
     if not text:
         return jsonify({"error": {"code": "bad_request",
                                   "message": "text is required."}}), 400
-    return jsonify(analyze_sentiment(text[:2000])), 200
+    return jsonify(analyze_sentiment_smart(text[:2000])), 200
 
 
 @bp.get("/insights/churn")

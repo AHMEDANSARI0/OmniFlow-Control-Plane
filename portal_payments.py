@@ -32,7 +32,7 @@ SETTINGS_TABLE = "portal_payment_settings"
 INTENTS_TABLE = "portal_payment_intents"
 _SETTINGS_DDL_READY = False
 _INTENTS_DDL_READY = False
-PROVIDERS = ("jazzcash", "easypaisa")
+PROVIDERS = ("jazzcash", "easypaisa", "stripe")
 MAX_AMOUNT = 100000
 
 
@@ -94,9 +94,22 @@ def _load_settings(cur, client_id):
     return rows[0] if rows else None
 
 
+def _stripe_secret() -> str:
+    """Platform Stripe secret key (admin panel first, env fallback)."""
+    try:
+        import platform_settings
+        stored = platform_settings.get_group("payments")
+        return (str(stored.get("secret_key") or "").strip()
+                or os.environ.get("STRIPE_SECRET_KEY", "").strip())
+    except Exception:
+        return os.environ.get("STRIPE_SECRET_KEY", "").strip()
+
+
 def _configured(row) -> bool:
     if row is None or not row.get("enabled"):
         return False
+    if str(row.get("provider") or "") == "stripe":
+        return bool(_stripe_secret())
     if str(row.get("provider") or "") == "jazzcash":
         return bool(row.get("merchant_id")) and bool(row.get("salt"))
     if str(row.get("provider") or "") == "easypaisa":
@@ -404,6 +417,32 @@ def public_pay(token: str):
                         "This order is already settled."), 400
                 intent_token = secrets.token_urlsafe(16)
                 base_url = request.host_url.rstrip("/")
+                if str(settings.get("provider") or "") == "stripe":
+                    session = _stripe_create_session(
+                        _stripe_secret(), intent_token, due,
+                        str(link.get("title") or "Order"), base_url)
+                    if "_error" in session or not session.get("url"):
+                        conn.rollback()
+                        return _render_message(
+                            "Payment unavailable",
+                            "Stripe rejected the session - check the"
+                            " platform keys."), 502
+                    cur.execute(
+                        "INSERT INTO " + portal_db._q(INTENTS_TABLE) +
+                        " (client_id, link_id, token, provider, amount)"
+                        " VALUES (%s, %s, %s, %s, %s)",
+                        (link.get("client_id"), link.get("id"),
+                         intent_token, "stripe", due),
+                    )
+                    portal_db.log_action(
+                        cur, link.get("client_id"), "payment.intent",
+                        "system", None, None,
+                        ("Stripe intent " + intent_token[:8]
+                         + " for " + str(due))[:200],
+                    )
+                    conn.commit()
+                    from flask import redirect
+                    return redirect(str(session["url"]), 302)
                 post_url, fields = _build_provider_form(
                     settings, intent_token, due, base_url)
                 cur.execute(
@@ -537,3 +576,139 @@ def public_callback(intent_token: str):
     return _render_message(
         "Payment received",
         "Thank you! The business can see your payment now."), 200
+
+
+_STRIPE_API = "https://api.stripe.com/v1/checkout/sessions"
+
+
+def _stripe_create_session(secret: str, intent_token: str, amount: float,
+                           title: str, base_url: str) -> Dict[str, Any]:
+    """Create one Stripe Checkout Session; {'url': ...} or {'_error'}."""
+    try:
+        import urllib.parse
+        import urllib.request
+        units = int(round(float(amount) * 100))
+        if units <= 0:
+            return {"_error": "amount"}
+        callback = (base_url + "/api/v1/public/payments/callback/"
+                    + urllib.parse.quote(intent_token, safe="")
+                    + "?stripe_return=1")
+        body = urllib.parse.urlencode({
+            "mode": "payment",
+            "success_url": callback,
+            "cancel_url": base_url,
+            "client_reference_id": intent_token,
+            "line_items[0][quantity]": "1",
+            "line_items[0][price_data][currency]": "pkr",
+            "line_items[0][price_data][unit_amount]": str(units),
+            "line_items[0][price_data][product_data][name]":
+                (title or "Order")[:120],
+        }).encode("utf8")
+        req = urllib.request.Request(
+            _STRIPE_API, data=body, method="POST",
+            headers={"Authorization": "Bearer " + secret,
+                     "Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf8"))
+        url = str(data.get("url") or "")
+        return {"url": url} if url else {"_error": "no session url"}
+    except Exception as error:
+        return {"_error": str(error) or "stripe request failed"}
+
+
+def _stripe_session_status(secret: str, session_id: str) -> Dict[str, Any]:
+    """GET one session; dict or {'_error': ...}."""
+    try:
+        import urllib.parse
+        import urllib.request
+        req = urllib.request.Request(
+            _STRIPE_API + "/" + urllib.parse.quote(session_id, safe=""),
+            headers={"Authorization": "Bearer " + secret},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf8"))
+    except Exception as error:
+        return {"_error": str(error) or "stripe request failed"}
+
+
+def _mark_stripe_paid(conn, intent_token: str, provider_ref: str):
+    """Shared tail of the stripe return: verify -> mark -> update link."""
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id, client_id, link_id, amount, status, provider"
+            " FROM " + portal_db._q(INTENTS_TABLE) +
+            " WHERE token = %s AND provider = 'stripe' LIMIT 1",
+            (intent_token,),
+        )
+        rows = portal_db.rows(cur)
+        if not rows:
+            return _render_message(
+                "Payment not found", "Unknown payment reference."), 404
+        intent = rows[0]
+        if intent.get("status") == "paid":
+            return _render_message(
+                "Already paid", "This payment was already recorded."), 200
+        cur.execute(
+            "UPDATE " + portal_db._q(INTENTS_TABLE) +
+            " SET status = 'paid', provider_ref = %s, updated_at = NOW()"
+            " WHERE id = %s AND status = 'pending' RETURNING id",
+            (provider_ref[:64], intent.get("id")),
+        )
+        applied = portal_db.rows(cur)
+        if applied:
+            amount = round(float(intent.get("amount") or 0), 2)
+            cur.execute(
+                "UPDATE " + portal_db._q(portal_checkout.LINKS_TABLE)
+                + " SET paid_amount = COALESCE(paid_amount, 0) + %s,"
+                " status = CASE WHEN COALESCE(paid_amount, 0) + %s"
+                " >= total THEN 'paid' ELSE status END,"
+                " updated_at = NOW()"
+                " WHERE id = %s AND client_id = %s"
+                " AND status = 'open' RETURNING paid_amount, total",
+                (amount, amount, intent.get("link_id"),
+                 intent.get("client_id")),
+            )
+            portal_db.log_action(
+                cur, intent.get("client_id"), "payment.gateway_paid",
+                "system", None, None,
+                ("Stripe payment " + str(amount) + " on link "
+                 + str(intent.get("link_id")))[:200],
+            )
+        conn.commit()
+    return _render_message(
+        "Payment received",
+        "Thank you! The business can see your payment now."), 200
+
+
+@public_bp.get("/payments/callback/<intent_token>")
+def public_stripe_return(intent_token: str):
+    """Stripe success_url lands here (GET) - verify then mark paid."""
+    intent_token = str(intent_token or "").strip()[:64]
+    session_id = str(request.args.get("session_id") or "").strip()[:200]
+    secret = _stripe_secret()
+    if not secret:
+        return _render_message(
+            "Payment unavailable", "Stripe is not configured."), 503
+    status = (_stripe_session_status(secret, session_id)
+              if session_id else {"_error": "missing session_id"})
+    if status.get("payment_status") != "paid":
+        return _render_message(
+            "Payment not completed",
+            "The payment did not go through - you can try again."), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            _ensure_intents_table(conn)
+            portal_checkout._ensure_checkout_tables(conn)
+            return _mark_stripe_paid(
+                conn, intent_token,
+                str(status.get("payment_intent")
+                    or status.get("id") or "stripe"))
+        finally:
+            conn.close()
+    except Exception as error:
+        logger.warning("stripe return failed: %s", error)
+        return _render_message(
+            "Payment unavailable", "Try again shortly."), 503

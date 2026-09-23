@@ -24,32 +24,6 @@ from portal_bot import bp as portal_bot_bp  # noqa: E402
 from portal_profile import bp as portal_profile_bp  # noqa: E402
 from portal_apikeys import bp as portal_apikeys_bp  # noqa: E402
 from portal_conversations import bp as portal_conversations_bp  # noqa: E402
-from connector_api import bp as connector_api_bp  # noqa: E402
-from portal_followups import bp as portal_followups_bp  # noqa: E402
-from portal_kb import bp as portal_kb_bp  # noqa: E402
-from portal_catalog import bp as portal_catalog_bp  # noqa: E402
-from portal_changes import bp as portal_changes_bp  # noqa: E402
-from portal_coupons import bp as portal_coupons_bp  # noqa: E402
-from portal_events import bp as portal_events_bp  # noqa: E402
-from portal_alerts import bp as portal_alerts_bp  # noqa: E402
-from portal_brain import bp as portal_brain_bp  # noqa: E402
-from portal_memory import bp as portal_memory_bp  # noqa: E402
-from portal_recovery import bp as portal_recovery_bp  # noqa: E402
-from portal_risk import bp as portal_risk_bp  # noqa: E402
-from portal_courier import bp as portal_courier_bp  # noqa: E402
-from portal_perf import bp as portal_perf_bp  # noqa: E402
-from portal_templates import bp as portal_templates_bp  # noqa: E402
-from portal_plans import bp as portal_plans_bp  # noqa: E402
-from portal_media import bp as portal_media_bp, connector_bp as portal_media_connector_bp  # noqa: E402
-from portal_analytics import bp as portal_analytics_bp  # noqa: E402
-from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
-from portal_interactive import bp as portal_interactive_bp  # noqa: E402
-from portal_wati import bp as portal_wati_bp  # noqa: E402
-from portal_revenue import bp as portal_revenue_bp  # noqa: E402
-from portal_payments import bp as portal_payments_bp  # noqa: E402
-from portal_restock import bp as portal_restock_bp  # noqa: E402
-from portal_value import bp as portal_value_bp  # noqa: E402
-from portal_team import bp as portal_team_bp  # noqa: E402
 from portal_growth import bp as portal_growth_bp  # noqa: E402
 from portal_cod import bp as portal_cod_bp  # noqa: E402
 from portal_segments import bp as portal_segments_bp  # noqa: E402
@@ -66,15 +40,43 @@ from portal_routing import bp as portal_routing_bp  # noqa: E402
 from portal_reco import bp as portal_reco_bp  # noqa: E402
 from portal_churn import bp as portal_churn_bp  # noqa: E402
 from portal_winback import bp as portal_winback_bp  # noqa: E402
+from portal_revenue import bp as portal_revenue_bp  # noqa: E402
+from portal_payments import bp as portal_payments_bp  # noqa: E402
+from portal_analytics import bp as portal_analytics_bp  # noqa: E402
+from portal_datasafety import bp as portal_datasafety_bp  # noqa: E402
+from portal_interactive import bp as portal_interactive_bp  # noqa: E402
+from portal_wati import bp as portal_wati_bp  # noqa: E402
+from portal_catalog import bp as portal_catalog_bp  # noqa: E402
+from portal_changes import bp as portal_changes_bp  # noqa: E402
+from portal_coupons import bp as portal_coupons_bp  # noqa: E402
+from portal_cloud import bp as portal_cloud_bp  # noqa: E402
+from portal_cloud import connector_bp as portal_cloud_connector_bp  # noqa: E402
+from portal_events import bp as portal_events_bp  # noqa: E402
+from portal_rollups import bp as portal_rollups_bp  # noqa: E402
+from portal_alerts import bp as portal_alerts_bp  # noqa: E402
+from portal_brain import bp as portal_brain_bp  # noqa: E402
+from portal_memory import bp as portal_memory_bp  # noqa: E402
+from portal_recovery import bp as portal_recovery_bp  # noqa: E402
+from portal_risk import bp as portal_risk_bp  # noqa: E402
+from portal_courier import bp as portal_courier_bp  # noqa: E402
+from portal_media import bp as portal_media_bp, connector_bp as portal_media_connector_bp  # noqa: E402
+from portal_perf import bp as portal_perf_bp  # noqa: E402
+from portal_templates import bp as portal_templates_bp  # noqa: E402
+from portal_plans import bp as portal_plans_bp  # noqa: E402
+from portal_brands import bp as portal_brands_bp  # noqa: E402
+from admin_providers import bp as admin_providers_bp  # noqa: E402
+from portal_voice import bp as portal_voice_bp, public_bp as portal_voice_public_bp  # noqa: E402
+from portal_video import bp as portal_video_bp  # noqa: E402
+from portal_obs import install_obs as _install_obs  # noqa: E402
+from portal_restock import bp as portal_restock_bp  # noqa: E402
+from portal_value import bp as portal_value_bp  # noqa: E402
 from portal_checkout import public_bp as portal_checkout_public_bp  # noqa: E402
 from portal_payments import public_bp as portal_payments_public_bp  # noqa: E402
 from portal_setup import bp as portal_setup_bp  # noqa: E402
 from portal_webhooks import bp as portal_webhooks_bp  # noqa: E402
 from portal_sequences import bp as portal_sequences_bp  # noqa: E402
-from portal_widget import bp as portal_widget_bp  # noqa: E402
+from connector_api import bp as connector_api_bp  # noqa: E402
 from portal_auth import bind_root_application  # noqa: E402
-from portal_rollups import bp as portal_rollups_bp  # noqa: E402
-from portal_obs import install_obs as _install_obs  # noqa: E402
 
 
 # --- Extension endpoints (password reset + admin + portal + connector) ------
@@ -89,23 +91,6 @@ aux_app.register_blueprint(portal_bot_bp)
 aux_app.register_blueprint(portal_profile_bp)
 aux_app.register_blueprint(portal_apikeys_bp)
 aux_app.register_blueprint(portal_conversations_bp)
-aux_app.register_blueprint(connector_api_bp)
-aux_app.register_blueprint(portal_followups_bp)
-aux_app.register_blueprint(portal_kb_bp)
-aux_app.register_blueprint(portal_catalog_bp)
-aux_app.register_blueprint(portal_changes_bp)
-aux_app.register_blueprint(portal_coupons_bp)
-aux_app.register_blueprint(portal_events_bp)
-aux_app.register_blueprint(portal_analytics_bp)
-aux_app.register_blueprint(portal_datasafety_bp)
-aux_app.register_blueprint(portal_interactive_bp)
-aux_app.register_blueprint(portal_wati_bp)
-aux_app.register_blueprint(portal_revenue_bp)
-aux_app.register_blueprint(portal_payments_bp)
-aux_app.register_blueprint(portal_payments_public_bp)
-aux_app.register_blueprint(portal_restock_bp)
-aux_app.register_blueprint(portal_value_bp)
-aux_app.register_blueprint(portal_team_bp)
 aux_app.register_blueprint(portal_growth_bp)
 aux_app.register_blueprint(portal_cod_bp)
 aux_app.register_blueprint(portal_segments_bp)
@@ -122,11 +107,18 @@ aux_app.register_blueprint(portal_routing_bp)
 aux_app.register_blueprint(portal_reco_bp)
 aux_app.register_blueprint(portal_churn_bp)
 aux_app.register_blueprint(portal_winback_bp)
-aux_app.register_blueprint(portal_checkout_public_bp)
-aux_app.register_blueprint(portal_setup_bp)
-aux_app.register_blueprint(portal_webhooks_bp)
-aux_app.register_blueprint(portal_sequences_bp)
-aux_app.register_blueprint(portal_widget_bp)
+aux_app.register_blueprint(portal_revenue_bp)
+aux_app.register_blueprint(portal_payments_bp)
+aux_app.register_blueprint(portal_analytics_bp)
+aux_app.register_blueprint(portal_datasafety_bp)
+aux_app.register_blueprint(portal_interactive_bp)
+aux_app.register_blueprint(portal_wati_bp)
+aux_app.register_blueprint(portal_catalog_bp)
+aux_app.register_blueprint(portal_changes_bp)
+aux_app.register_blueprint(portal_coupons_bp)
+aux_app.register_blueprint(portal_cloud_bp)
+aux_app.register_blueprint(portal_cloud_connector_bp)
+aux_app.register_blueprint(portal_events_bp)
 aux_app.register_blueprint(portal_rollups_bp)
 aux_app.register_blueprint(portal_alerts_bp)
 aux_app.register_blueprint(portal_brain_bp)
@@ -135,11 +127,24 @@ aux_app.register_blueprint(portal_recovery_bp)
 aux_app.register_blueprint(portal_risk_bp)
 aux_app.register_blueprint(portal_courier_bp)
 aux_app.register_blueprint(portal_media_bp)
+aux_app.register_blueprint(portal_media_connector_bp)
 aux_app.register_blueprint(portal_perf_bp)
 aux_app.register_blueprint(portal_templates_bp)
 aux_app.register_blueprint(portal_plans_bp)
-aux_app.register_blueprint(portal_media_connector_bp)
+aux_app.register_blueprint(portal_brands_bp)
+aux_app.register_blueprint(admin_providers_bp)
+aux_app.register_blueprint(portal_voice_bp)
+aux_app.register_blueprint(portal_voice_public_bp)
+aux_app.register_blueprint(portal_video_bp)
 _install_obs(aux_app)
+aux_app.register_blueprint(portal_payments_public_bp)
+aux_app.register_blueprint(portal_restock_bp)
+aux_app.register_blueprint(portal_value_bp)
+aux_app.register_blueprint(portal_checkout_public_bp)
+aux_app.register_blueprint(portal_setup_bp)
+aux_app.register_blueprint(portal_webhooks_bp)
+aux_app.register_blueprint(portal_sequences_bp)
+aux_app.register_blueprint(connector_api_bp)
 
 _EXTENSION_PREFIXES = (
     "/api/v1/auth/forgot-password",

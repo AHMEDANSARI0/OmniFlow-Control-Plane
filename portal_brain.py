@@ -402,10 +402,24 @@ def draft_reply(cur, client_id: int, conversation_id: int,
         None, conversation_id,
         "Brain draft requested (" + decision + ").",
     )
-    return {"decision": decision,
-            "draft": reply,
-            "grounding": grounding,
-            "autonomy": settings.get("autonomy")}
+    result = {"decision": decision,
+              "draft": reply,
+              "grounding": grounding,
+              "autonomy": settings.get("autonomy")}
+    # KB auto-draft (owner decision, admin panel): when on, a draft also
+    # ships a saveable knowledge-base entry so good answers stop being
+    # one-offs. Fail-soft: the plain draft is always there.
+    try:
+        import platform_settings
+        if platform_settings.flag("kb_autodraft") and reply:
+            result["kb_entry"] = {
+                "title": (message_text or "").strip()[:120]
+                         or "Saved answer",
+                "content": str(reply),
+            }
+    except Exception:
+        pass
+    return result
 
 
 # ---------------------------------------------------------------------------

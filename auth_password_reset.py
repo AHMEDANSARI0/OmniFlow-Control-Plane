@@ -79,29 +79,89 @@ def _code_hash(code: str) -> str:
 
 
 def _smtp_configured() -> bool:
-    return bool(os.environ.get("SMTP_HOST", "").strip())
+    """Admin-panel email config first, env fallback (DB-backed config)."""
+    try:
+        import platform_settings
+        config = platform_settings.smtp_config()
+        if config["provider"] == "brevo":
+            return bool(config["brevo_api_key"])
+        return bool(config["smtp_host"])
+    except Exception:
+        return bool(os.environ.get("SMTP_HOST", "").strip())
 
 
 def _send_email(to_address: str, code: str) -> bool:
-    """Best-effort code delivery. False = code stays in logs/admin panel."""
-    host = os.environ.get("SMTP_HOST", "").strip()
+    """Best-effort code delivery. False = code stays in logs/admin panel.
+
+    Brevo API when the panel says provider=brevo, SMTP otherwise;
+    both fall back to the environment variables when the panel has
+    nothing saved.
+    """
+    try:
+        import platform_settings
+        config = platform_settings.smtp_config()
+    except Exception:
+        config = None
+    host = (config or {}).get("smtp_host") or os.environ.get("SMTP_HOST", "").strip()
+    if (config or {}).get("provider") == "brevo" \
+            and (config or {}).get("brevo_api_key"):
+        try:
+            import json as _json
+            import urllib.request
+            sender = (config or {}).get("smtp_from") \
+                or os.environ.get("SMTP_FROM",
+                                  "OmniFlow <no-reply@omniflow.app>")
+            name = sender[:sender.index("<")].strip() \
+                if "<" in sender else "OmniFlow"
+            email_addr = sender[sender.index("<") + 1:sender.rindex(">")] \
+                if "<" in sender else (sender or "no-reply@omniflow.app")
+            sender_payload = {"email": email_addr}
+            if name:
+                sender_payload["name"] = name
+            payload = _json.dumps({
+                "sender": sender_payload,
+                "to": [{"email": to_address}],
+                "subject": "OmniFlow password reset code",
+                "textContent":
+                    "Your OmniFlow password reset code is: " + code + "\n\n"
+                    "Ye code " + str(CODE_TTL_MINUTES)
+                    + " minutes ke liye valid hai.\n"
+                    "Agar aapne ye request nahi ki, is email ko ignore karein.",
+            }).encode("utf8")
+            req = urllib.request.Request(
+                "https://api.brevo.com/v3/smtp/email",
+                data=payload,
+                headers={"api-key": config["brevo_api_key"],
+                         "content-type": "application/json",
+                         "accept": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return 200 <= resp.status < 300
+        except Exception:
+            logger.exception("reset code email delivery failed")
+            return False
     if not host:
         return False
     try:
         msg = EmailMessage()
         msg["Subject"] = "OmniFlow password reset code"
-        msg["From"] = os.environ.get("SMTP_FROM", "OmniFlow <no-reply@omniflow.app>")
+        msg["From"] = (config or {}).get("smtp_from") \
+            or os.environ.get("SMTP_FROM", "OmniFlow <no-reply@omniflow.app>")
         msg["To"] = to_address
         msg.set_content(
             "Your OmniFlow password reset code is: " + code + "\n\n"
-            "This code is valid for " + str(CODE_TTL_MINUTES) + " minutes.\n"
-            "If you did not request this, you can safely ignore this email."
+            "Ye code " + str(CODE_TTL_MINUTES) + " minutes ke liye valid hai.\n"
+            "Agar aapne ye request nahi ki, is email ko ignore karein."
         )
-        port = int(os.environ.get("SMTP_PORT", "587"))
+        port = int((config or {}).get("smtp_port")
+                   or os.environ.get("SMTP_PORT", "587"))
         with smtplib.SMTP(host, port, timeout=15) as server:
             server.starttls()
-            user = os.environ.get("SMTP_USER", "").strip()
-            password = os.environ.get("SMTP_PASSWORD", "")
+            user = (config or {}).get("smtp_user") \
+                or os.environ.get("SMTP_USER", "").strip()
+            password = (config or {}).get("smtp_password") \
+                or os.environ.get("SMTP_PASSWORD", "")
             if user:
                 server.login(user, password)
             server.send_message(msg)
@@ -136,7 +196,7 @@ def forgot_password():
     email = payload.get("email")
     if not isinstance(email, str) or not email.strip():
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Email is required."}}), 400
+                                  "message": "Email zaroori hai."}}), 400
     email = email.strip().lower()
 
     delivered = False
@@ -202,10 +262,10 @@ def reset_password():
 
     if not isinstance(code, str) or not code.strip():
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Reset code is required."}}), 400
+                                  "message": "Reset code zaroori hai."}}), 400
     if not isinstance(new_password, str) or len(new_password) < 8:
         return jsonify({"error": {"code": "bad_request",
-                                  "message": "Password must be at least 8 characters."}}), 400
+                                  "message": "Password kam az kam 8 characters ka ho."}}), 400
     code = code.strip()
 
     conn = None
@@ -222,7 +282,7 @@ def reset_password():
         row = cur.fetchone()
         if not row:
             return jsonify({"error": {"code": "invalid_code",
-                                      "message": "Invalid code. Please check it and try again."}}), 400
+                                      "message": "Code galat hai. Dobara check karein."}}), 400
 
         token_id, user_id, expires_at, attempts = row
         now = _utcnow()
@@ -230,10 +290,10 @@ def reset_password():
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         if isinstance(expires_at, datetime) and expires_at < now:
             return jsonify({"error": {"code": "code_expired",
-                                      "message": "This code has expired. Please request a new one."}}), 400
+                                      "message": "Code expire ho gaya. Naya code mangwayein."}}), 400
         if int(attempts or 0) >= CODE_MAX_ATTEMPTS:
             return jsonify({"error": {"code": "too_many_attempts",
-                                      "message": "Too many attempts. Please request a new code."}}), 400
+                                      "message": "Bohat zyada koshishen. Naya code mangwayein."}}), 400
 
         cur.execute(
             f"UPDATE {_q(TOKENS_TABLE)} SET used_at = NOW() WHERE id = %s",
