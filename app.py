@@ -66,6 +66,7 @@ from portal_plans import bp as portal_plans_bp  # noqa: E402
 from portal_brands import bp as portal_brands_bp  # noqa: E402
 from admin_providers import bp as admin_providers_bp  # noqa: E402
 from portal_voice import bp as portal_voice_bp, public_bp as portal_voice_public_bp  # noqa: E402
+from portal_brands import store_bp as portal_brands_store_bp  # noqa: E402
 from portal_video import bp as portal_video_bp  # noqa: E402
 from portal_obs import install_obs as _install_obs  # noqa: E402
 from portal_restock import bp as portal_restock_bp  # noqa: E402
@@ -135,6 +136,7 @@ aux_app.register_blueprint(portal_brands_bp)
 aux_app.register_blueprint(admin_providers_bp)
 aux_app.register_blueprint(portal_voice_bp)
 aux_app.register_blueprint(portal_voice_public_bp)
+aux_app.register_blueprint(portal_brands_store_bp)
 aux_app.register_blueprint(portal_video_bp)
 _install_obs(aux_app)
 aux_app.register_blueprint(portal_payments_public_bp)

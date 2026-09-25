@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 from typing import Any, Dict
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, jsonify, request, Response
 
 import platform_settings
 import portal_auth
@@ -48,8 +48,17 @@ _DDL = (
     " sid TEXT NOT NULL DEFAULT '',"
     " status TEXT NOT NULL DEFAULT 'queued',"
     " message TEXT NOT NULL DEFAULT '',"
+    " direction TEXT NOT NULL DEFAULT 'outbound',"
+    " recording_url TEXT NOT NULL DEFAULT '',"
+    " duration_seconds INT NOT NULL DEFAULT 0,"
     " created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()"
     ")"
+)
+_DDL_MIGRATE = (
+    "ALTER TABLE " + portal_db._q(CALLS_TABLE) +
+    " ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'outbound',"
+    " ADD COLUMN IF NOT EXISTS recording_url TEXT NOT NULL DEFAULT '',"
+    " ADD COLUMN IF NOT EXISTS duration_seconds INT NOT NULL DEFAULT 0"
 )
 _DDL_INDEX = (
     "CREATE INDEX IF NOT EXISTS portal_voice_calls_idx ON "
@@ -62,6 +71,7 @@ def _ensure_ddl(cur) -> None:
     if _DDL_READY:
         return
     cur.execute(_DDL)
+    cur.execute(_DDL_MIGRATE)
     cur.execute(_DDL_INDEX)
     _DDL_READY = True
 
@@ -129,6 +139,66 @@ def _xml_escape(text: str) -> str:
             .replace("<", "&lt;").replace(">", "&gt;"))
 
 
+DEFAULT_GREETING = ("Thank you for calling! Please leave your message "
+                    "after the tone.")
+INBOUND_MAX_SECONDS = 120
+
+
+def _greeting() -> str:
+    """Owner-recorded greeting (admin panel voice group) or the default."""
+    try:
+        stored = platform_settings.get_group("voice") or {}
+    except Exception:
+        stored = {}
+    return str(stored.get("greeting") or "").strip()[:200] \
+        or DEFAULT_GREETING
+
+
+def _digits(raw: str) -> str:
+    return "".join(ch for ch in str(raw or "") if ch.isdigit())
+
+
+def _match_caller(cur, from_digits: str):
+    """Find the conversation whose contact jid shares the caller's last
+    9 digits (the Pakistani national number). Returns (client_id,
+    conversation_id) or (0, None) for unknown callers."""
+    tail = from_digits[-9:]
+    if len(from_digits) < 10:
+        return 0, None
+    cur.execute(
+        "SELECT client_id, id FROM " + portal_db._q("portal_conversations") +
+        " WHERE right(regexp_replace(contact_id, '\\D', '', 'g'), 9) = %s"
+        " ORDER BY id DESC LIMIT 1",
+        (tail,),
+    )
+    rows = portal_db.rows(cur)
+    if not rows:
+        return 0, None
+    return int(rows[0].get("client_id") or 0), \
+        int(rows[0].get("id") or 0)
+
+
+def _media_url(recording_url: str) -> str:
+    """Twilio serves recordings at <RecordingUrl>.mp3."""
+    url = str(recording_url or "")
+    if not url.endswith(".mp3") and not url.endswith(".wav"):
+        url = url + ".mp3"
+    return url
+
+
+def _twilio_fetch_media(keys: Dict[str, str], recording_url: str) -> bytes:
+    """GET the recording media from Twilio (Basic auth) - raw bytes."""
+    url = _media_url(recording_url)
+    token = base64.b64encode(
+        (keys["account_sid"] + ":" + keys["auth_token"])
+        .encode("utf8")).decode("ascii")
+    req = urllib.request.Request(url, method="GET", headers={
+        "Authorization": "Basic " + token,
+    })
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read()
+
+
 def _row_public(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "id": int(row.get("id") or 0),
@@ -137,6 +207,9 @@ def _row_public(row: Dict[str, Any]) -> Dict[str, Any]:
         "sid": str(row.get("sid") or ""),
         "status": str(row.get("status") or "queued"),
         "message": str(row.get("message") or ""),
+        "direction": str(row.get("direction") or "outbound"),
+        "has_recording": bool(row.get("recording_url")),
+        "duration_seconds": int(row.get("duration_seconds") or 0),
         "created_at": str(row.get("created_at") or ""),
     }
 
@@ -155,7 +228,8 @@ def list_voice_calls():
                 _ensure_ddl(cur)
                 cur.execute(
                     "SELECT id, contact_id, phone, sid, status,"
-                    " message, created_at FROM "
+                    " message, direction, recording_url,"
+                    " duration_seconds, created_at FROM "
                     + portal_db._q(CALLS_TABLE) +
                     " WHERE client_id = %s ORDER BY id DESC LIMIT %s",
                     (principal["client_id"], LOG_LIMIT),
@@ -260,3 +334,149 @@ def voice_webhook():
         except Exception:
             logger.warning("voice webhook update failed", exc_info=True)
     return "", 204
+
+
+@public_bp.post("/voice/incoming")
+def voice_incoming():
+    """Twilio inbound-call webhook: greet the caller and take a voicemail.
+
+    The caller is matched to a conversation by phone digits so the
+    voicemail lands in the right workspace's call log; unknown callers
+    are recorded under the platform inbox (client 0).
+    """
+    sid = str(request.form.get("CallSid") or "").strip()[:64]
+    from_raw = str(request.form.get("From") or "").strip()[:32]
+    if not sid or not _digits(from_raw):
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Missing call details."}}), 400
+    from_digits = _digits(from_raw)
+    phone = from_raw if from_raw.startswith("+") \
+        else "+" + from_digits
+    client_id, conversation_id = 0, None
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                _ensure_ddl(cur)
+                client_id, conversation_id = _match_caller(cur, from_digits)
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(CALLS_TABLE) +
+                    " (client_id, contact_id, phone, sid, status,"
+                    " message, direction) VALUES (%s, %s, %s, %s, %s,"
+                    " %s, 'inbound')",
+                    (client_id, str(conversation_id or ""), phone, sid,
+                     "in-progress", "Inbound call"),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("inbound call log failed", exc_info=True)
+    site = (os.environ.get("OMNIFLOW_SITE_URL", "").strip()
+            or request.host_url.rstrip("/"))
+    action = site + "/api/v1/public/voice/record"
+    twiml = ('<?xml version="1.0" encoding="UTF-8"?><Response><Say>'
+             + _xml_escape(_greeting())
+             + '</Say><Record transcribe="0" maxLength="'
+             + str(INBOUND_MAX_SECONDS)
+             + '" method="POST" action="' + _xml_escape(action)
+             + '"/></Response>')
+    return twiml, 200, {"Content-Type": "application/xml"}
+
+
+@public_bp.post("/voice/record")
+def voice_record():
+    """Twilio post-recording webhook: attach the voicemail to the call."""
+    sid = str(request.form.get("CallSid") or "").strip()[:64]
+    recording_url = str(request.form.get("RecordingUrl") or "").strip()[:500]
+    duration = str(request.form.get("RecordingDuration") or "0").strip()
+    try:
+        duration_seconds = min(3600, max(0, int(duration)))
+    except ValueError:
+        duration_seconds = 0
+    if not sid or not recording_url:
+        return jsonify({"error": {"code": "bad_request",
+                                  "message": "Missing recording"
+                                             " details."}}), 400
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                _ensure_ddl(cur)
+                cur.execute(
+                    "UPDATE " + portal_db._q(CALLS_TABLE) +
+                    " SET status = 'recorded', recording_url = %s,"
+                    " duration_seconds = %s"
+                    " WHERE sid = %s AND direction = 'inbound'"
+                    " RETURNING client_id, contact_id",
+                    (recording_url, duration_seconds, sid),
+                )
+                updated = portal_db.rows(cur)
+                if updated and int(updated[0].get("client_id") or 0) > 0:
+                    portal_db.log_action(
+                        cur, int(updated[0]["client_id"]),
+                        "voice.inbound", "customer",
+                        None, None,
+                        ("Voicemail from ..."
+                         + _digits(str(request.form.get("From") or ""))[-4:]
+                         )[:200],
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("voicemail attach failed", exc_info=True)
+    return ('<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+            200, {"Content-Type": "application/xml"})
+
+
+@bp.get("/voice/recordings/<sid>")
+def voice_recording(sid: str):
+    """Stream a voicemail from Twilio to the signed-in portal user."""
+    sid = sid.strip()[:64]
+    principal, _ = _principal_or_error()
+    if principal is None:
+        return jsonify({"error": {"code": "unauthorized",
+                                  "message": "Sign in required."}}), 401
+    try:
+        portal_db.ensure_tables()
+        conn = portal_db._conn()
+        try:
+            with conn.cursor() as cur:
+                _ensure_ddl(cur)
+                cur.execute(
+                    "SELECT recording_url FROM "
+                    + portal_db._q(CALLS_TABLE) +
+                    " WHERE sid = %s AND recording_url <> ''"
+                    " AND (client_id = %s OR direction = 'inbound')"
+                    " ORDER BY id DESC LIMIT 1",
+                    (sid, principal["client_id"]),
+                )
+                rows = portal_db.rows(cur)
+        finally:
+            conn.close()
+    except Exception as error:
+        return jsonify(portal_db.portal_unavailable(
+            error, "voicemail")[0]), 503
+    if not rows:
+        return jsonify({"error": {"code": "not_found",
+                                  "message": "Voicemail not found."}}), 404
+    keys = _voice_keys()
+    if not voice_configured(keys):
+        return jsonify({"error": {"code": "not_configured",
+                                  "message": "Voice is not configured -"
+                                             " add the Twilio keys in the"
+                                             " admin panel Integrations"
+                                             " page."}}), 409
+    try:
+        media = _twilio_fetch_media(keys, rows[0].get("recording_url"))
+    except Exception:
+        logger.warning("voicemail fetch failed", exc_info=True)
+        return jsonify({"error": {"code": "twilio_error",
+                                  "message": "Twilio would not serve the"
+                                             " recording - check the"
+                                             " saved keys."}}), 502
+    return Response(media, content_type="audio/mpeg",
+                    headers={"Cache-Control": "no-store"})
