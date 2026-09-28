@@ -6,7 +6,8 @@ messages by REASONING OVER TOOLS - all read-only in v1:
 
   * recent_messages  - the last messages of this conversation;
   * customer_orders  - the contact's recent checkout links (status/total);
-  * search_kb        - active knowledge-base entries matching the text;
+  * search_kb        - ranked knowledge: owner Q&A entries + published
+                     document sections (portal_knowledge.retrieve);
   * customer_profile - stored language (tone matching).
 
 Every decision is bounded (OF_BRAIN_MAX_TOOL_CALLS), grounded (the prompt
@@ -20,6 +21,14 @@ Autonomy per tenant (portal_brain_settings.autonomy):
             /portal/brain/draft; the ingest path never fires;
   auto    - the ingest hook may queue a reply itself when confidence >=
             OF_BRAIN_MIN_CONFIDENCE and policy passes.
+
+v2 adds the STRUCTURED BUSINESS CONTEXT layer (the giant-prompt killer):
+the owner stores policies / SOPs / pricing / refund + escalation rules as
+queryable rows (portal_brain_facts) instead of pasting essays into the
+prompt. The reasoner queries them per message (tool_business_facts) and
+grounds on them like any other tool; owners manage them via
+GET/POST/DELETE /portal/brain/facts and the Business facts card on
+Configure AI.
 
 Fail-soft everywhere: a missing LLM key, an outage or any db error makes
 the brain step aside (None) and the B3 keyword path handles the message.
@@ -50,6 +59,9 @@ MAX_TOOL_CALLS = int(os.environ.get("OF_BRAIN_MAX_TOOL_CALLS", "3") or 3)
 MIN_CONFIDENCE = float(
     os.environ.get("OF_BRAIN_MIN_CONFIDENCE", "0.6") or 0.6)
 MAX_DRAFT_CHARS = int(os.environ.get("OF_BRAIN_MAX_DRAFT_CHARS", "700") or 700)
+FACTS_TABLE = "portal_brain_facts"
+FACTS_LIMIT = int(os.environ.get("OF_BRAIN_FACTS_LIMIT", "100") or 100)
+FACT_KINDS = ("policy", "sop", "pricing", "refund", "escalation", "hours")
 
 _DDL_READY = False
 
@@ -71,15 +83,47 @@ CREATE TABLE IF NOT EXISTS portal_brain_traces (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_brain_traces
   ON portal_brain_traces (client_id, conversation_id, id DESC);
+CREATE TABLE IF NOT EXISTS portal_brain_facts (
+  id BIGSERIAL PRIMARY KEY,
+  client_id BIGINT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'policy',
+  label TEXT NOT NULL DEFAULT '',
+  content TEXT NOT NULL DEFAULT '',
+  keywords TEXT NOT NULL DEFAULT '',
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_portal_brain_facts
+  ON portal_brain_facts (client_id, is_active, id DESC);
 """
 
 
 def _ensure_ddl(cur) -> None:
-    """Create the brain tables once per process (lazy DDL)."""
+    """Create the brain tables once per process (lazy DDL). The knowledge
+    tables ride along so search_kb can join document chunks on a fresh
+    install before the owner ever opens the Knowledge page."""
     global _DDL_READY
     if _DDL_READY:
         return
     cur.execute(_DDL)
+    try:
+        import portal_knowledge
+
+        portal_knowledge._ensure_ddl(cur)
+    except Exception as error:  # pragma: no cover - fail-soft
+        logger.warning("knowledge DDL skipped: %s", error)
+    try:
+        import portal_escalation
+
+        portal_escalation._ensure_ddl(cur)
+    except Exception as error:  # pragma: no cover - fail-soft
+        logger.warning("escalation DDL skipped: %s", error)
+    try:
+        import portal_agents
+
+        portal_agents._ensure_ddl(cur)
+    except Exception as error:  # pragma: no cover - fail-soft
+        logger.warning("agents DDL skipped: %s", error)
     _DDL_READY = True
 
 
@@ -112,6 +156,39 @@ def _load_settings(cur, client_id: int) -> Dict[str, Any]:
         return {"autonomy": "suggest", "tone": ""}
     return {"autonomy": str(rows[0].get("autonomy") or "suggest"),
             "tone": str(rows[0].get("tone") or "")}
+
+
+AUTONOMY_ORDER = {"off": 0, "suggest": 1, "auto": 2}
+
+
+def platform_controls() -> Dict[str, Any]:
+    """Platform AI controls (admin AI Control Center) - fail-soft copy of
+    platform_settings.ai_controls(): {kill_switch, autonomy_cap,
+    daily_call_cap, source}. Defaults never restrict anything."""
+    try:
+        import platform_settings
+
+        controls = platform_settings.ai_controls()
+        if isinstance(controls, dict):
+            return controls
+    except Exception:
+        pass
+    return {"kill_switch": False, "autonomy_cap": "auto",
+            "daily_call_cap": 0, "source": "default"}
+
+
+def effective_autonomy(own: str,
+                       controls: Optional[Dict[str, Any]] = None) -> str:
+    """The autonomy the brain actually runs at: the workspace's own level
+    capped by the platform (kill switch = off; autonomy_cap = ceiling)."""
+    controls = controls if isinstance(controls, dict) else platform_controls()
+    own = own if own in AUTONOMY_ORDER else "suggest"
+    if controls.get("kill_switch"):
+        return "off"
+    cap = str(controls.get("autonomy_cap") or "auto")
+    if cap not in AUTONOMY_ORDER:
+        cap = "auto"
+    return own if AUTONOMY_ORDER[own] <= AUTONOMY_ORDER[cap] else cap
 
 
 # ---------------------------------------------------------------------------
@@ -156,22 +233,36 @@ def tool_customer_orders(cur, client_id: int, contact_id: str,
 
 def tool_search_kb(cur, client_id: int, query: str,
                    n: int = 3) -> List[Dict[str, Any]]:
-    text = str(query or "").strip()[:120]
+    """Knowledge for the answer: owner Q&A entries AND published document
+    sections (portal_knowledge.retrieve - one tenant-scoped query, ranked
+    by token relevance). Each hit carries kind/source/score so the trace
+    can cite where the answer came from."""
+    text = str(query or "").strip()[:200]
     if not text:
         return []
-    cur.execute(
-        "SELECT id, title, content FROM " + portal_db._q("portal_kb_entries") +
-        " WHERE client_id = %s AND is_active = TRUE"
-        " AND (title ILIKE %s OR content ILIKE %s OR keywords ILIKE %s)"
-        " ORDER BY id DESC LIMIT %s",
-        (client_id, "%" + text + "%", "%" + text + "%", "%" + text + "%",
-         max(1, min(5, n))),
-    )
-    rows = portal_db.rows(cur)
-    return [{"id": int(r.get("id") or 0),
-             "title": str(r.get("title") or ""),
-             "content": str(r.get("content") or "")[:400]}
-            for r in rows]
+    try:
+        import portal_knowledge
+    except Exception:  # pragma: no cover - older deploy without the module
+        portal_knowledge = None
+    if portal_knowledge is None:
+        cur.execute(
+            "SELECT id, title, content FROM " + portal_db._q("portal_kb_entries") +
+            " WHERE client_id = %s AND is_active = TRUE"
+            " AND (title ILIKE %s OR content ILIKE %s OR keywords ILIKE %s)"
+            " ORDER BY id DESC LIMIT %s",
+            (client_id, "%" + text + "%", "%" + text + "%", "%" + text + "%",
+             max(1, min(5, n))),
+        )
+        return [{"id": int(r.get("id") or 0), "kind": "entry",
+                 "title": str(r.get("title") or ""),
+                 "content": str(r.get("content") or "")[:400],
+                 "source": "", "score": 0}
+                for r in portal_db.rows(cur)]
+    hits = portal_knowledge.retrieve(cur, client_id, text, max(1, min(5, n)))
+    return [{"id": h["id"], "kind": h["kind"], "title": h["title"],
+             "content": h["content"][:400], "source": h["source"],
+             "score": h["score"]}
+            for h in hits]
 
 
 def tool_customer_profile(cur, client_id: int,
@@ -184,6 +275,61 @@ def tool_customer_profile(cur, client_id: int,
     except Exception:
         language = None
     return {"language": language}
+
+
+def tool_business_facts(cur, client_id: int, query: str,
+                        n: int = 3) -> List[Dict[str, Any]]:
+    """v2: query the tenant's structured business context (policies,
+    SOPs, pricing, refund/escalation rules, hours). Active rows only,
+    tenant-scoped, matched over label + content + keywords."""
+    text = str(query or "").strip()[:120]
+    if not text:
+        return []
+    cur.execute(
+        "SELECT id, kind, label, content FROM " +
+        portal_db._q(FACTS_TABLE) +
+        " WHERE client_id = %s AND is_active = TRUE"
+        " AND (label ILIKE %s OR content ILIKE %s OR keywords ILIKE %s)"
+        " ORDER BY id DESC LIMIT %s",
+        (client_id, "%" + text + "%", "%" + text + "%", "%" + text + "%",
+         max(1, min(5, n))),
+    )
+    rows = portal_db.rows(cur)
+    return [{"id": int(r.get("id") or 0),
+             "kind": str(r.get("kind") or "policy"),
+             "label": str(r.get("label") or ""),
+             "content": str(r.get("content") or "")[:400]}
+            for r in rows]
+
+
+def tool_customer_memory(cur, client_id: int, contact_id: str,
+                         n: int = 3) -> List[Dict[str, Any]]:
+    """Memory upgrade: read the customer's own memory rows (preferences,
+    notes, facts, journey position) - non-expired only, tenant-scoped,
+    read-only. Fail-soft: any problem means [] (the reply just loses
+    personalization, never breaks)."""
+    contact = str(contact_id or "").strip()
+    if not contact:
+        return []
+    try:
+        import portal_memory
+
+        cur.execute(
+            "SELECT id, kind, mtype, content FROM " +
+            portal_db._q(portal_memory.MEMORY_TABLE) +
+            " WHERE client_id = %s AND contact_id = %s"
+            " AND (expires_at IS NULL OR expires_at > NOW())"
+            " ORDER BY id DESC LIMIT %s",
+            (client_id, contact, max(1, min(5, n))),
+        )
+        rows = portal_db.rows(cur)
+        return [{"id": int(r.get("id") or 0),
+                 "kind": str(r.get("kind") or "note"),
+                 "mtype": str(r.get("mtype") or "long"),
+                 "content": str(r.get("content") or "")[:200]}
+                for r in rows]
+    except Exception:
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +377,16 @@ def _system_prompt(tone: str) -> str:
         "Customers often write in Roman Urdu; reply in the customer's "
         "language, short and friendly. You may ONLY use facts from the "
         "provided CONTEXT - never invent orders, prices, dates or policies. "
+        "CONTEXT may include BUSINESS facts (policies, pricing, SOPs, "
+        "hours, refund and escalation rules); treat them as the owner's "
+        "own rules and follow them exactly. CONTEXT may include KB items: "
+        "owner-written answers (kind entry) and excerpts from the "
+        "business's own documents (kind chunk, with source); answer from "
+        "them and never go beyond what they say. CONTEXT may also include "
+        "MEMORY notes about THIS customer (preferences, past issues, "
+        "journey position); personalize using them. CONTEXT may include "
+        "an AGENT persona (name + instructions); when present, answer AS "
+        "that agent and follow its instructions. "
         "NEVER promise refunds, discounts or delivery dates; NEVER mention "
         "internal systems. If the context is insufficient or the customer "
         "needs a human, set needs_human=true. " + tone_line +
@@ -267,12 +423,48 @@ def _reason(cur, client_id: int, conversation_id: int, contact_id: str,
     if kb:
         context["kb"] = kb
         grounding["tools"].append("search_kb")
+    facts = tool_business_facts(cur, client_id, message_text, 3)
+    calls += 1
+    if facts:
+        context["business"] = facts
+        grounding["tools"].append("business_facts")
+    memories = tool_customer_memory(cur, client_id, contact_id, 3)
+    calls += 1
+    if memories:
+        context["memory"] = memories
+        grounding["tools"].append("customer_memory")
+    agent = None
+    try:
+        import portal_agents
+
+        agent = portal_agents.agent_for_conversation(cur, client_id,
+                                                     conversation_id)
+    except Exception:
+        agent = None
+    calls += 1
+    if agent:
+        context["agent"] = {"name": agent.get("name"),
+                            "instructions":
+                            str(agent.get("instructions") or "")[:400]}
+        grounding["tools"].append("agent_persona")
+        grounding["agent_id"] = agent.get("id")
+        grounding["agent_auto_reply"] = agent.get("can_auto_reply", True) \
+            is not False
+        if str(agent.get("tone") or "").strip():
+            tone = str(agent.get("tone"))
     profile = tool_customer_profile(cur, client_id, contact_id)
     if profile.get("language"):
         context["language"] = profile["language"]
         grounding["tools"].append("customer_profile")
     grounding["conversation_messages"] = len(context["conversation"])
-    grounding["kb_ids"] = [e["id"] for e in kb]
+    grounding["kb_ids"] = [e["id"] for e in kb if e.get("kind", "entry") == "entry"]
+    grounding["knowledge_ids"] = [e["id"] for e in kb if e.get("kind") == "chunk"]
+    grounding["citations"] = [
+        {"source": e.get("source") or "", "section": e.get("title") or "",
+         "score": e.get("score") or 0}
+        for e in kb if e.get("kind") == "chunk"]
+    grounding["fact_ids"] = [f["id"] for f in facts]
+    grounding["memory_ids"] = [m["id"] for m in memories]
     grounding["order_ids"] = [o["id"] for o in orders]
     del budget_left
 
@@ -281,11 +473,12 @@ def _reason(cur, client_id: int, conversation_id: int, contact_id: str,
 
     import portal_llm
 
-    payload = portal_llm.chat_json(
-        _system_prompt(tone),
-        json.dumps(context, ensure_ascii=False, default=str),
-        max_tokens=300,
-    )
+    with portal_llm.usage_scope("brain", client_id, cur):
+        payload = portal_llm.chat_json(
+            _system_prompt(tone),
+            json.dumps(context, ensure_ascii=False, default=str),
+            max_tokens=300,
+        )
     grounding["llm_called"] = payload is not None
     return payload, grounding
 
@@ -335,6 +528,30 @@ def _write_trace(cur, client_id: int, conversation_id: int, kind: str,
 # Ingest hook (autonomy == auto only) + owner draft API
 # ---------------------------------------------------------------------------
 
+def _handoff(cur, client_id: int, conversation_id: int,
+             grounding: Dict[str, Any]) -> None:
+    """A handoff decision under 'auto' autonomy is a real event, not a
+    silent trace: needs_human / low_confidence / policy blocks open ONE
+    escalation per conversation (portal_escalation: assignee + bell +
+    optional email). Platform problems (llm_unavailable, empty_reply) are
+    not customer situations and never page the team. Never raises."""
+    reason = str(grounding.get("reason") or "")
+    if not (reason in ("needs_human", "low_confidence")
+            or reason.startswith("policy:")):
+        return
+    try:
+        import portal_escalation
+
+        confidence = grounding.get("confidence")
+        note = "AI handoff: " + reason
+        if isinstance(confidence, (int, float)) and reason == "low_confidence":
+            note += " (confidence " + str(round(float(confidence), 2)) + ")"
+        portal_escalation.escalate(cur, client_id, conversation_id, reason,
+                                   "ai", note=note)
+    except Exception as error:
+        logger.warning("brain handoff escalation failed: %s", error)
+
+
 def maybe_answer(client_id, conversation_id, contact_id, contact_name,
                  body, conn) -> Optional[bool]:
     """Ingest hook: answer under 'auto' autonomy; return True when the
@@ -346,16 +563,23 @@ def maybe_answer(client_id, conversation_id, contact_id, contact_name,
         with conn.cursor() as cur:
             _ensure_ddl(cur)
             settings = _load_settings(cur, client_id)
-            if settings.get("autonomy") != "auto":
+            if effective_autonomy(str(settings.get("autonomy") or "")) \
+                    != "auto":
                 return None
             payload, grounding = _reason(
                 cur, client_id, int(conversation_id or 0),
                 str(contact_id or ""), str(contact_name or ""), text,
                 str(settings.get("tone") or ""))
             decision, reply, grounding = _decide(payload, grounding)
+            if decision == "send" and grounding.get("agent_auto_reply") \
+                    is False:
+                # Persona permission: drafts only - the owner sends.
+                decision = "handoff"
+                grounding["reason"] = "agent_draft_only"
             _write_trace(cur, client_id, int(conversation_id or 0),
                          "ingest_answer", decision, grounding)
             if decision != "send":
+                _handoff(cur, client_id, int(conversation_id or 0), grounding)
                 return None
             payload_out = {
                 "external_user_id": str(contact_id or ""),
@@ -440,6 +664,14 @@ def get_brain_settings():
         conn.commit()
     finally:
         conn.close()
+    controls = platform_controls()
+    settings["platform"] = {
+        "paused": bool(controls.get("kill_switch")),
+        "autonomy_cap": str(controls.get("autonomy_cap") or "auto"),
+        "daily_call_cap": int(controls.get("daily_call_cap") or 0),
+        "effective_autonomy": effective_autonomy(
+            str(settings.get("autonomy") or ""), controls),
+    }
     return jsonify({"settings": settings}), 200
 
 
@@ -561,3 +793,167 @@ def list_brain_traces():
             "created_at": str(r.get("created_at") or "")}
            for r in rows]
     return jsonify({"traces": out}), 200
+
+
+# ---------------------------------------------------------------------------
+# v2: structured business context (facts) - owner CRUD
+# ---------------------------------------------------------------------------
+
+def _shape_fact(row: Dict[str, Any]) -> Dict[str, Any]:
+    return {"id": int(row.get("id") or 0),
+            "kind": str(row.get("kind") or "policy"),
+            "label": str(row.get("label") or ""),
+            "content": str(row.get("content") or ""),
+            "keywords": str(row.get("keywords") or ""),
+            "is_active": bool(row.get("is_active")),
+            "updated_at": str(row.get("updated_at") or "")}
+
+
+@bp.get("/brain/facts")
+def list_brain_facts():
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal.get("client_id") or 0)
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            cur.execute(
+                "SELECT id, kind, label, content, keywords, is_active,"
+                " updated_at FROM " + portal_db._q(FACTS_TABLE) +
+                " WHERE client_id = %s"
+                " ORDER BY is_active DESC, id DESC LIMIT %s",
+                (client_id, max(1, min(500, FACTS_LIMIT))),
+            )
+            rows = portal_db.rows(cur)
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"facts": [_shape_fact(r) for r in rows]}), 200
+
+
+@bp.post("/brain/facts")
+def save_brain_fact():
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal.get("client_id") or 0)
+    payload = request.get_json(silent=True) or {}
+    fact_id = 0
+    try:
+        fact_id = int(payload.get("id") or 0)
+    except Exception:
+        fact_id = 0
+    kind = str(payload.get("kind") or "policy")
+    label = str(payload.get("label") or "").strip()
+    content = str(payload.get("content") or "").strip()
+    keywords = str(payload.get("keywords") or "").strip()
+    is_active = payload.get("is_active", True)
+    if not isinstance(is_active, bool):
+        is_active = bool(is_active)
+    if kind not in FACT_KINDS:
+        return jsonify({"error": {
+            "code": "bad_request",
+            "message": "kind must be one of " + "|".join(FACT_KINDS) + ".",
+        }}), 400
+    if not label or len(label) > 120:
+        return jsonify({"error": {
+            "code": "bad_request",
+            "message": "label is required (max 120 characters).",
+        }}), 400
+    if not content or len(content) > 2000:
+        return jsonify({"error": {
+            "code": "bad_request",
+            "message": "content is required (max 2000 characters).",
+        }}), 400
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            if fact_id > 0:
+                cur.execute(
+                    "UPDATE " + portal_db._q(FACTS_TABLE) +
+                    " SET kind = %s, label = %s, content = %s,"
+                    " keywords = %s, is_active = %s, updated_at = NOW()"
+                    " WHERE id = %s AND client_id = %s RETURNING id",
+                    (kind, label[:120], content[:2000], keywords[:200],
+                     is_active, fact_id, client_id),
+                )
+                rows = portal_db.rows(cur)
+                if not rows:
+                    conn.rollback()
+                    return jsonify({"error": {
+                        "code": "not_found",
+                        "message": "No such fact in this workspace.",
+                    }}), 404
+                action = "updated"
+            else:
+                cur.execute(
+                    "INSERT INTO " + portal_db._q(FACTS_TABLE) +
+                    " (client_id, kind, label, content, keywords,"
+                    " is_active, updated_at)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, NOW())"
+                    " RETURNING id",
+                    (client_id, kind, label[:120], content[:2000],
+                     keywords[:200], is_active),
+                )
+                rows = portal_db.rows(cur)
+                action = "created"
+            portal_db.log_action(
+                cur, client_id, "brain.facts", "human",
+                None, None,
+                "Business fact " + action + ": " + label[:80] + ".",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"fact": {"id": int(rows[0].get("id") or 0),
+                             "kind": kind, "label": label,
+                             "content": content, "keywords": keywords,
+                             "is_active": is_active}}), 200
+
+
+@bp.delete("/brain/facts")
+def delete_brain_fact():
+    """Soft delete (data-preserving): the row just goes inactive and the
+    owner can re-activate it from the same card."""
+    principal, auth_error = _principal_or_error()
+    if auth_error:
+        return auth_error
+    client_id = int(principal.get("client_id") or 0)
+    try:
+        fact_id = int(request.args.get("id") or 0)
+    except Exception:
+        fact_id = 0
+    if fact_id <= 0:
+        return jsonify({"error": {
+            "code": "bad_request",
+            "message": "id (positive integer) is required.",
+        }}), 400
+    conn = portal_db._conn()
+    try:
+        with conn.cursor() as cur:
+            _ensure_ddl(cur)
+            cur.execute(
+                "UPDATE " + portal_db._q(FACTS_TABLE) +
+                " SET is_active = FALSE, updated_at = NOW()"
+                " WHERE id = %s AND client_id = %s RETURNING id",
+                (fact_id, client_id),
+            )
+            rows = portal_db.rows(cur)
+            if not rows:
+                conn.rollback()
+                return jsonify({"error": {
+                    "code": "not_found",
+                    "message": "No such fact in this workspace.",
+                }}), 404
+            portal_db.log_action(
+                cur, client_id, "brain.facts", "human",
+                None, None,
+                "Business fact archived (id " + str(fact_id) + ").",
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    return jsonify({"ok": True}), 200

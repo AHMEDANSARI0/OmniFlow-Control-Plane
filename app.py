@@ -15,6 +15,8 @@ if str(SRC_DIR) not in sys.path:
 os.environ.setdefault("PGSSLMODE", "require")
 
 from flask import Flask  # noqa: E402
+from werkzeug.exceptions import MethodNotAllowed, NotFound  # noqa: E402
+from werkzeug.routing import RequestRedirect  # noqa: E402
 
 from control_plane.http_api import create_control_plane_api  # noqa: E402
 from auth_password_reset import bp as auth_password_reset_bp  # noqa: E402
@@ -55,6 +57,16 @@ from portal_events import bp as portal_events_bp  # noqa: E402
 from portal_rollups import bp as portal_rollups_bp  # noqa: E402
 from portal_alerts import bp as portal_alerts_bp  # noqa: E402
 from portal_brain import bp as portal_brain_bp  # noqa: E402
+from portal_agents import bp as portal_agents_bp  # noqa: E402
+from portal_workflows import bp as portal_workflows_bp  # noqa: E402
+from portal_identity import bp as portal_identity_bp  # noqa: E402
+from portal_knowledge import bp as portal_knowledge_bp  # noqa: E402
+from portal_notify import bp as portal_notify_bp  # noqa: E402
+from portal_escalation import bp as portal_escalation_bp  # noqa: E402
+from portal_ai_usage import bp as portal_ai_usage_bp  # noqa: E402
+from portal_ai_audit import bp as portal_ai_audit_bp  # noqa: E402
+from portal_bi import bp as portal_bi_bp  # noqa: E402
+from admin_ai import bp as admin_ai_bp  # noqa: E402
 from portal_memory import bp as portal_memory_bp  # noqa: E402
 from portal_recovery import bp as portal_recovery_bp  # noqa: E402
 from portal_risk import bp as portal_risk_bp  # noqa: E402
@@ -68,6 +80,10 @@ from admin_providers import bp as admin_providers_bp  # noqa: E402
 from portal_voice import bp as portal_voice_bp, public_bp as portal_voice_public_bp  # noqa: E402
 from portal_brands import store_bp as portal_brands_store_bp  # noqa: E402
 from portal_video import bp as portal_video_bp  # noqa: E402
+from portal_approvals import bp as portal_approvals_bp  # noqa: E402
+from portal_intelligence import bp as portal_intelligence_bp  # noqa: E402
+from portal_actions import bp as portal_actions_bp  # noqa: E402
+from portal_policy import bp as portal_policy_bp  # noqa: E402
 from portal_obs import install_obs as _install_obs  # noqa: E402
 from portal_restock import bp as portal_restock_bp  # noqa: E402
 from portal_value import bp as portal_value_bp  # noqa: E402
@@ -123,6 +139,16 @@ aux_app.register_blueprint(portal_events_bp)
 aux_app.register_blueprint(portal_rollups_bp)
 aux_app.register_blueprint(portal_alerts_bp)
 aux_app.register_blueprint(portal_brain_bp)
+aux_app.register_blueprint(portal_agents_bp)
+aux_app.register_blueprint(portal_workflows_bp)
+aux_app.register_blueprint(portal_identity_bp)
+aux_app.register_blueprint(portal_knowledge_bp)
+aux_app.register_blueprint(portal_notify_bp)
+aux_app.register_blueprint(portal_escalation_bp)
+aux_app.register_blueprint(portal_ai_usage_bp)
+aux_app.register_blueprint(portal_ai_audit_bp)
+aux_app.register_blueprint(portal_bi_bp)
+aux_app.register_blueprint(admin_ai_bp)
 aux_app.register_blueprint(portal_memory_bp)
 aux_app.register_blueprint(portal_recovery_bp)
 aux_app.register_blueprint(portal_risk_bp)
@@ -133,6 +159,10 @@ aux_app.register_blueprint(portal_perf_bp)
 aux_app.register_blueprint(portal_templates_bp)
 aux_app.register_blueprint(portal_plans_bp)
 aux_app.register_blueprint(portal_brands_bp)
+aux_app.register_blueprint(portal_approvals_bp)
+aux_app.register_blueprint(portal_intelligence_bp)
+aux_app.register_blueprint(portal_actions_bp)
+aux_app.register_blueprint(portal_policy_bp)
 aux_app.register_blueprint(admin_providers_bp)
 aux_app.register_blueprint(portal_voice_bp)
 aux_app.register_blueprint(portal_voice_public_bp)
@@ -157,6 +187,28 @@ _EXTENSION_PREFIXES = (
     "/api/v1/connector/",
 )
 
+# Every route the extension blueprints define, resolved from the aux URL
+# map itself. The prefix tuple above is the fast path; this is the safety
+# net so a registered blueprint (public checkout / store / voice webhooks,
+# admin providers / email test / weekly report / AI control) can never sit
+# unreachable behind the primary API's 404.
+_AUX_URLS = aux_app.url_map.bind("omniflow-extensions")
+
+
+def _aux_serves(path: str, method: str) -> bool:
+    """True when aux_app should answer this request."""
+    if path.startswith(_EXTENSION_PREFIXES):
+        return True
+    try:
+        _AUX_URLS.match(path, method=(method or "GET").upper())
+    except NotFound:
+        return False
+    except (MethodNotAllowed, RequestRedirect):
+        return True
+    except Exception:  # pragma: no cover - dispatch itself must never fail
+        return False
+    return True
+
 
 class _CompositeWsgi:
     """Dispatches extension paths to aux_app, everything else to the API."""
@@ -167,7 +219,7 @@ class _CompositeWsgi:
 
     def __call__(self, environ, start_response):
         path = environ.get("PATH_INFO", "")
-        if path.startswith(_EXTENSION_PREFIXES):
+        if _aux_serves(path, environ.get("REQUEST_METHOD", "GET")):
             return self._aux(environ, start_response)
         return self._primary(environ, start_response)
 

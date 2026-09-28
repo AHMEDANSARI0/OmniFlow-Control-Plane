@@ -11,7 +11,6 @@ and combine additively, never below zero.
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -22,6 +21,7 @@ from portal_auth import (
 )
 import portal_db
 import portal_checkout
+from typing import Any, Dict, Optional, Tuple
 
 bp = Blueprint("portal_coupons", __name__, url_prefix="/api/v1/portal")
 public_bp = Blueprint("portal_coupons_public", __name__,

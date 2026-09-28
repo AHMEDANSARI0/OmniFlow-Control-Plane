@@ -11,7 +11,6 @@ never messaged).
 
 import datetime
 import logging
-from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -22,6 +21,7 @@ from portal_auth import (
 )
 import portal_db
 import portal_checkout
+from typing import Any, Dict, List, Optional
 
 bp = Blueprint("portal_changes", __name__, url_prefix="/api/v1/portal")
 public_bp = Blueprint("portal_changes_public", __name__,

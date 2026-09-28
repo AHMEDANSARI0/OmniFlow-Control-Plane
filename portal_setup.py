@@ -1,7 +1,6 @@
 """Setup progress: which onboarding milestones this client has reached."""
 
 import logging
-from typing import Any
 
 from flask import Blueprint, jsonify
 

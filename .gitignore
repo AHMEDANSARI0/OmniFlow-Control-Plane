@@ -26,3 +26,7 @@ Thumbs.db
 *.bak
 *.zip
 *.pre_*.bak
+# patcher backups + bytecode stay out of git
+*.dir_conflict.bak
+*.dir_conflict.bak.*
+*.pyc

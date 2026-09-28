@@ -409,13 +409,24 @@ def send_media():
 # ---------------------------------------------------------------------------
 
 def _stt_config() -> Optional[Tuple[str, str, str]]:
-    key = os.environ.get("OMNIFLOW_STT_API_KEY", "").strip()
+    """Admin-panel STT settings first (platform_settings.stt_config),
+    env fallback - the same live-without-redeploy path as the LLM and
+    Twilio keys. The base/model defaults live here."""
+    try:
+        import platform_settings
+        config = platform_settings.stt_config()
+    except Exception:
+        config = {}
+    key = (str(config.get("api_key") or "").strip()
+           or os.environ.get("OMNIFLOW_STT_API_KEY", "").strip())
     if not key:
         return None
-    base = os.environ.get("OMNIFLOW_STT_BASE", "").strip() \
-        or STT_BASE_DEFAULT
-    model = os.environ.get("OMNIFLOW_STT_MODEL", "").strip() \
-        or STT_MODEL_DEFAULT
+    base = (str(config.get("base_url") or "").strip()
+            or os.environ.get("OMNIFLOW_STT_BASE", "").strip()
+            or STT_BASE_DEFAULT)
+    model = (str(config.get("model") or "").strip()
+             or os.environ.get("OMNIFLOW_STT_MODEL", "").strip()
+             or STT_MODEL_DEFAULT)
     return base.rstrip("/"), key, model
 
 

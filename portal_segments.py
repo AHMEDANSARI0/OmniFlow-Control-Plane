@@ -2,7 +2,6 @@
 
 import json
 import logging
-from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -14,6 +13,7 @@ from portal_auth import (
 import portal_db
 import portal_growth
 import portal_pipeline
+from typing import Any, Dict, List, Optional
 
 bp = Blueprint("portal_segments", __name__, url_prefix="/api/v1/portal")
 

@@ -49,7 +49,6 @@ DEFAULTS: Dict[str, Any] = {
     "working_hours_start": "09:00",
     "working_hours_end": "18:00",
     "human_handoff_enabled": False,
-    "custom_instructions": "",
 }
 
 
@@ -88,19 +87,19 @@ def _validated_config(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
     agent_name = _pick(payload, "agent_name", "agentName")
     agent_name = (agent_name or "").strip() if isinstance(agent_name, str) else ""
     if not _NAME_RE.match(agent_name):
-        return None, "Agent name must be 1-64 characters."
+        return None, "Agent name 1-64 characters ka hona chahiye."
 
     tone = _pick(payload, "tone")
     tone = (tone or "").strip() if isinstance(tone, str) else ""
     if tone not in TONES:
-        return None, "Tone must be friendly, professional, or concise."
+        return None, "Tone friendly, professional ya concise ho sakta hai."
 
     greeting = _pick(payload, "greeting")
     greeting = greeting if isinstance(greeting, str) else ""
     fallback = _pick(payload, "fallback")
     fallback = fallback if isinstance(fallback, str) else ""
     if not _TEXT_RE.match(greeting) or not _TEXT_RE.match(fallback):
-        return None, "Greeting and fallback must be under 2000 characters."
+        return None, "Greeting/fallback 2000 characters se chhote rakhein."
 
     wh_enabled = _as_bool(_pick(payload, "working_hours_enabled", "workingHoursEnabled"), False)
     wh_start = _pick(payload, "working_hours_start", "workingHoursStart")
@@ -109,16 +108,11 @@ def _validated_config(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
     wh_end = (wh_end or "").strip() if isinstance(wh_end, str) else DEFAULTS["working_hours_end"]
     if wh_enabled:
         if not _TIME_RE.match(wh_start) or not _TIME_RE.match(wh_end):
-            return None, "Working hours must use the HH:MM format (for example 09:00)."
+            return None, "Working hours HH:MM format me hon (jaise 09:00)."
         if wh_start >= wh_end:
-            return None, "Working hours start must be earlier than the end."
+            return None, "Working hours ka start end se pehle hona chahiye."
 
     handoff = _as_bool(_pick(payload, "human_handoff_enabled", "humanHandoffEnabled"), False)
-
-    custom_instructions = _pick(payload, "custom_instructions", "customInstructions")
-    custom_instructions = custom_instructions if isinstance(custom_instructions, str) else ""
-    if not _TEXT_RE.match(custom_instructions):
-        return None, "Custom instructions 2000 characters se chhote rakhein."
 
     config = {
         "agent_name": agent_name,
@@ -129,7 +123,6 @@ def _validated_config(payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]]
         "working_hours_start": wh_start,
         "working_hours_end": wh_end,
         "human_handoff_enabled": handoff,
-        "custom_instructions": custom_instructions,
     }
     return config, None
 
@@ -153,7 +146,7 @@ def get_bot_config():
                 cur.execute(
                     "SELECT agent_name, tone, greeting, fallback,"
                     " working_hours_enabled, working_hours_start, working_hours_end,"
-                    " human_handoff_enabled, custom_instructions, updated_at"
+                    " human_handoff_enabled, updated_at"
                     " FROM " + portal_db._q(portal_db.BOT_TABLE) +
                     " WHERE client_id = %s",
                     (principal["client_id"],),
@@ -177,7 +170,6 @@ def get_bot_config():
             "working_hours_start": row.get("working_hours_start") or DEFAULTS["working_hours_start"],
             "working_hours_end": row.get("working_hours_end") or DEFAULTS["working_hours_end"],
             "human_handoff_enabled": row.get("human_handoff_enabled") is True,
-            "custom_instructions": row.get("custom_instructions") or "",
         }
         updated_at = _iso(row.get("updated_at"))
 
@@ -216,8 +208,8 @@ def put_bot_config():
                     "INSERT INTO " + portal_db._q(portal_db.BOT_TABLE) +
                     " (client_id, agent_name, tone, greeting, fallback,"
                     " working_hours_enabled, working_hours_start, working_hours_end,"
-                    " human_handoff_enabled, custom_instructions, updated_by, updated_at) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()) "
+                    " human_handoff_enabled, updated_by, updated_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW()) "
                     "ON CONFLICT (client_id) DO UPDATE SET "
                     " agent_name = EXCLUDED.agent_name,"
                     " tone = EXCLUDED.tone,"
@@ -227,7 +219,6 @@ def put_bot_config():
                     " working_hours_start = EXCLUDED.working_hours_start,"
                     " working_hours_end = EXCLUDED.working_hours_end,"
                     " human_handoff_enabled = EXCLUDED.human_handoff_enabled,"
-                    " custom_instructions = EXCLUDED.custom_instructions,"
                     " updated_by = EXCLUDED.updated_by,"
                     " updated_at = NOW() "
                     "RETURNING updated_at",
@@ -235,7 +226,6 @@ def put_bot_config():
                      config["greeting"], config["fallback"],
                      config["working_hours_enabled"], config["working_hours_start"],
                      config["working_hours_end"], config["human_handoff_enabled"],
-                     config["custom_instructions"],
                      principal["user_id"]),
                 )
                 inserted = portal_db.rows(cur)

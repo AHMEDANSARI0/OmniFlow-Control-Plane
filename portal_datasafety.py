@@ -2,7 +2,6 @@
 retention controls (auto-close idle conversations, purge rejected action
 requests). Everything is owner-only and audited."""
 import logging
-from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, Response, jsonify, request
 
@@ -13,6 +12,7 @@ from portal_auth import (
 )
 import portal_checkout
 import portal_db
+from typing import Tuple
 
 bp = Blueprint("portal_datasafety", __name__, url_prefix="/api/v1/portal")
 logger = logging.getLogger(__name__)

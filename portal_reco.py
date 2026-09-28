@@ -6,7 +6,6 @@ Read-only: no new tables."""
 
 import logging
 import re
-from typing import Any, Dict, List, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -15,6 +14,7 @@ from portal_auth import (
     authenticate_portal_request,
 )
 import portal_db
+from typing import Any, Dict, List
 
 bp = Blueprint("portal_reco", __name__, url_prefix="/api/v1/portal")
 

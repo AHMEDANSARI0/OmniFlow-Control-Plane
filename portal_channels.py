@@ -36,7 +36,7 @@ logger = logging.getLogger("omniflow.portal-channels")
 bp = Blueprint("portal_channels", __name__, url_prefix="/api/v1/portal")
 
 ALLOWED_STATES = ("disconnected", "connecting", "connected")
-ALLOWED_ACTIONS = ("connect", "disconnect", "restart")
+ALLOWED_ACTIONS = ("connect", "disconnect")
 
 
 def _iso(value: Any) -> Optional[str]:
@@ -112,11 +112,7 @@ def post_whatsapp_action():
     message = (
         "Connect request queued — your connector will link the WhatsApp account shortly."
         if action == "connect"
-        else (
-            "Restart request queued — your connector will refresh the session."
-            if action == "restart"
-            else "Disconnect request queued — your connector will log the account out."
-        )
+        else "Disconnect request queued — your connector will log the account out."
     )
 
     try:

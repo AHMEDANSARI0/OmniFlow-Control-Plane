@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS portal_bot_configs (
   working_hours_start TEXT NOT NULL DEFAULT '09:00',
   working_hours_end TEXT NOT NULL DEFAULT '18:00',
   human_handoff_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-  custom_instructions TEXT NOT NULL DEFAULT '',
   updated_by BIGINT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );

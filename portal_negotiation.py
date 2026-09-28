@@ -2,7 +2,6 @@
 counter-offer calculator (no AI)."""
 
 import logging
-from typing import Any, Dict, Optional, Tuple
 
 from flask import Blueprint, jsonify, request
 
@@ -12,6 +11,7 @@ from portal_auth import (
     ensure_human_principal,
 )
 import portal_db
+from typing import Any, Dict
 
 bp = Blueprint("portal_negotiation", __name__, url_prefix="/api/v1/portal")
 

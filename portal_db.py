@@ -30,21 +30,13 @@ PROFILE_TABLE = os.environ.get("OF_PROFILE_TABLE", "portal_profiles")
 APIKEY_TABLE = os.environ.get("OF_APIKEY_TABLE", "portal_api_keys")
 CONV_TABLE = os.environ.get("OF_CONV_TABLE", "portal_conversations")
 MSGS_TABLE = os.environ.get("OF_MSGS_TABLE", "portal_messages")
-TEAM_TABLE = os.environ.get("OF_TEAM_TABLE", "portal_team_members")
+USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
+USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
 NOTES_TABLE = os.environ.get("OF_NOTES_TABLE", "portal_conversation_notes")
 BROADCASTS_TABLE = os.environ.get("OF_BROADCASTS_TABLE", "portal_broadcasts")
 GAPS_TABLE = os.environ.get("OF_GAPS_TABLE", "portal_kb_gaps")
 CSAT_TABLE = os.environ.get("OF_CSAT_TABLE", "portal_csat_requests")
-WIDGET_TABLE = os.environ.get("OF_WIDGET_TABLE", "portal_widget_settings")
-CONV_TAGS_TABLE = os.environ.get("OF_CONVTAGS_TABLE", "portal_conversation_tags")
-SAVED_REPLIES_TABLE = os.environ.get("OF_SAVEDREPLIES_TABLE", "portal_saved_replies")
-AUTOMATIONS_TABLE = os.environ.get("OF_AUTOMATIONS_TABLE", "portal_automations")
-AUTOMATION_SETTINGS_TABLE = os.environ.get(
-    "OF_AUTOMSETTINGS_TABLE", "portal_automation_settings"
-)
-CUSTOMER_NOTES_TABLE = os.environ.get("OF_CUSTNOTES_TABLE", "portal_customer_notes")
-USERS_TABLE = os.environ.get("OF_USERS_TABLE", "platform_users")
-USER_EMAIL_COL = os.environ.get("OF_USER_EMAIL_COL", "email")
+SAVED_REPLIES_TABLE = os.environ.get("OF_SAVED_REPLIES_TABLE", "portal_saved_replies")
 
 _ensure_lock = threading.Lock()
 _ensured = False
@@ -69,7 +61,6 @@ CREATE TABLE IF NOT EXISTS portal_bot_configs (
   working_hours_start TEXT NOT NULL DEFAULT '09:00',
   working_hours_end TEXT NOT NULL DEFAULT '18:00',
   human_handoff_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-  custom_instructions TEXT NOT NULL DEFAULT '',
   updated_by BIGINT,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -135,133 +126,12 @@ CREATE TABLE IF NOT EXISTS portal_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_portal_messages_conv
   ON portal_messages (conversation_id, id);
-ALTER TABLE portal_conversations
-  ADD COLUMN IF NOT EXISTS last_read_at TIMESTAMPTZ;
-ALTER TABLE portal_messages
-  ADD COLUMN IF NOT EXISTS intent TEXT;
-ALTER TABLE portal_conversations
-  ADD COLUMN IF NOT EXISTS last_intent TEXT;
-CREATE TABLE IF NOT EXISTS portal_followup_settings (
-  client_id BIGINT PRIMARY KEY,
-  enabled BOOLEAN NOT NULL DEFAULT FALSE,
-  delay_hours INT NOT NULL DEFAULT 24,
-  max_attempts INT NOT NULL DEFAULT 2,
-  message_template TEXT NOT NULL DEFAULT '',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS portal_followups (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  conversation_id BIGINT NOT NULL UNIQUE,
-  contact_id TEXT NOT NULL,
-  contact_name TEXT,
-  stage TEXT NOT NULL DEFAULT 'waiting',
-  intent TEXT,
-  attempts INT NOT NULL DEFAULT 0,
-  last_note TEXT,
-  next_due_at TIMESTAMPTZ,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_portal_followups_due
-  ON portal_followups (client_id, stage, next_due_at);
-CREATE TABLE IF NOT EXISTS portal_kb_settings (
-  client_id BIGINT PRIMARY KEY,
-  auto_reply BOOLEAN NOT NULL DEFAULT FALSE,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS portal_kb_entries (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  title TEXT NOT NULL,
-  category TEXT NOT NULL DEFAULT 'general',
-  keywords TEXT NOT NULL DEFAULT '',
-  content TEXT NOT NULL,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  usage_count INT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_portal_kb_entries
-  ON portal_kb_entries (client_id, is_active, updated_at DESC);
-CREATE TABLE IF NOT EXISTS portal_catalog (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  kind TEXT NOT NULL DEFAULT 'product',
-  name TEXT NOT NULL,
-  price_text TEXT NOT NULL DEFAULT '',
-  notes TEXT NOT NULL DEFAULT '',
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_portal_catalog
-  ON portal_catalog (client_id, kind, is_active);
-CREATE TABLE IF NOT EXISTS portal_action_log (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  action TEXT NOT NULL,
-  actor_kind TEXT NOT NULL DEFAULT 'customer_user',
-  actor_user_id BIGINT,
-  conversation_id BIGINT,
-  note TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_portal_action_log
-  ON portal_action_log (client_id, id DESC);
-ALTER TABLE portal_conversations
-  ADD COLUMN IF NOT EXISTS lead_score INT NOT NULL DEFAULT 0;
-ALTER TABLE portal_conversations
-  ADD COLUMN IF NOT EXISTS lead_temp TEXT NOT NULL DEFAULT 'cold';
-CREATE TABLE IF NOT EXISTS portal_cod_orders (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  conversation_id BIGINT NOT NULL UNIQUE,
-  contact_id TEXT NOT NULL,
-  contact_name TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',
-  details TEXT NOT NULL DEFAULT '',
-  attempts INT NOT NULL DEFAULT 1,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  answered_at TIMESTAMPTZ
-);
-CREATE INDEX IF NOT EXISTS idx_portal_cod_orders
-  ON portal_cod_orders (client_id, status);
-CREATE TABLE IF NOT EXISTS portal_orders (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  code TEXT NOT NULL,
-  status_text TEXT NOT NULL DEFAULT 'pending',
-  note TEXT NOT NULL DEFAULT '',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT uq_portal_order_code UNIQUE (client_id, code)
-);
-CREATE INDEX IF NOT EXISTS idx_portal_orders_client
-  ON portal_orders (client_id, updated_at DESC);
-ALTER TABLE portal_conversations
-  ADD COLUMN IF NOT EXISTS assigned_to TEXT;
-CREATE TABLE IF NOT EXISTS portal_team_members (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  email TEXT NOT NULL,
-  name TEXT NOT NULL DEFAULT '',
-  role TEXT NOT NULL DEFAULT 'agent',
-  status TEXT NOT NULL DEFAULT 'active',
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT uq_portal_team_email UNIQUE (client_id, email)
-);
-CREATE INDEX IF NOT EXISTS idx_portal_team_client
-  ON portal_team_members (client_id, status);
 CREATE TABLE IF NOT EXISTS portal_conversation_notes (
   id BIGSERIAL PRIMARY KEY,
   client_id BIGINT NOT NULL,
   conversation_id BIGINT NOT NULL,
-  author_email TEXT NOT NULL DEFAULT '',
-  author_name TEXT NOT NULL DEFAULT '',
-  body TEXT NOT NULL,
+  author_email TEXT,
+  body TEXT NOT NULL DEFAULT '',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_portal_conv_notes
@@ -296,83 +166,10 @@ CREATE TABLE IF NOT EXISTS portal_csat_requests (
   contact_name TEXT,
   score INT,
   requested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  answered_at TIMESTAMPTZ,
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+  answered_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_portal_csat
-  ON portal_csat_requests (client_id, score);
-CREATE TABLE IF NOT EXISTS portal_widget_settings (
-  id INT PRIMARY KEY,
-  client_id BIGINT,
-  enabled BOOLEAN NOT NULL DEFAULT TRUE,
-  business_name TEXT NOT NULL DEFAULT '',
-  welcome_text TEXT NOT NULL DEFAULT '',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE TABLE IF NOT EXISTS portal_automation_settings (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL UNIQUE,
-  welcome_enabled BOOLEAN NOT NULL DEFAULT FALSE,
-  welcome_text TEXT NOT NULL DEFAULT '',
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-ALTER TABLE portal_automation_settings
-  ADD COLUMN IF NOT EXISTS close_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE portal_automation_settings
-  ADD COLUMN IF NOT EXISTS close_after_hours INT NOT NULL DEFAULT 48;
-ALTER TABLE portal_automation_settings
-  ADD COLUMN IF NOT EXISTS assign_enabled BOOLEAN NOT NULL DEFAULT FALSE;
-CREATE TABLE IF NOT EXISTS portal_customer_notes (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  contact_id TEXT NOT NULL,
-  body TEXT NOT NULL,
-  author_email TEXT,
-  author_name TEXT,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-CREATE INDEX IF NOT EXISTS idx_portal_customer_notes
-  ON portal_customer_notes (client_id, contact_id, id DESC);
-CREATE TABLE IF NOT EXISTS portal_conversation_tags (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  conversation_id BIGINT NOT NULL,
-  tag TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT uq_portal_conv_tag UNIQUE (client_id, conversation_id, tag)
-);
-CREATE INDEX IF NOT EXISTS idx_portal_conv_tags_conv
-  ON portal_conversation_tags (conversation_id, id);
-CREATE TABLE IF NOT EXISTS portal_saved_replies (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  shortcut TEXT NOT NULL,
-  body TEXT NOT NULL,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT uq_portal_saved_reply UNIQUE (client_id, shortcut)
-);
-CREATE INDEX IF NOT EXISTS idx_portal_saved_replies
-  ON portal_saved_replies (client_id, id DESC);
-ALTER TABLE portal_widget_settings
-  ADD COLUMN IF NOT EXISTS accent TEXT NOT NULL DEFAULT '#22d3ee';
-ALTER TABLE portal_widget_settings
-  ADD COLUMN IF NOT EXISTS position TEXT NOT NULL DEFAULT 'right';
-ALTER TABLE portal_widget_settings
-  ADD COLUMN IF NOT EXISTS launcher_label TEXT NOT NULL DEFAULT '';
-CREATE TABLE IF NOT EXISTS portal_automations (
-  id BIGSERIAL PRIMARY KEY,
-  client_id BIGINT NOT NULL,
-  keyword TEXT NOT NULL,
-  action_type TEXT NOT NULL,
-  action_value TEXT NOT NULL,
-  is_active BOOLEAN NOT NULL DEFAULT TRUE,
-  times_triggered INT NOT NULL DEFAULT 0,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  CONSTRAINT uq_portal_automation UNIQUE (client_id, keyword, action_type, action_value)
-);
-CREATE INDEX IF NOT EXISTS idx_portal_automations
-  ON portal_automations (client_id, is_active);
+CREATE INDEX IF NOT EXISTS idx_portal_csat_requests
+  ON portal_csat_requests (client_id, requested_at DESC);
 """
 
 
@@ -429,6 +226,19 @@ def rows(cur) -> List[Dict[str, Any]]:
     return [dict(zip(cols, row)) for row in cur.fetchall()]
 
 
+def portal_unavailable(error: Exception, context: str) -> Any:
+    """Log + return the 503 response used by every portal/connector route."""
+    logger.exception("portal storage failure: %s", context)
+    return (
+        {"error": {"code": "portal_unavailable",
+                   "message": "Storage is temporarily unavailable, try again shortly."}},
+        503,
+    )
+
+TEAM_TABLE = os.environ.get("OF_TEAM_TABLE", "portal_team_members")
+CONV_TAGS_TABLE = os.environ.get("OF_CONV_TAGS_TABLE", "portal_conversation_tags")
+
+
 def log_action(cur, client_id, action, actor_kind="customer_user",
                actor_user_id=None, conversation_id=None, note=""):
     """Append one row to the action audit log (portal_action_log)."""
@@ -437,14 +247,4 @@ def log_action(cur, client_id, action, actor_kind="customer_user",
         " (client_id, action, actor_kind, actor_user_id, conversation_id,"
         " note, created_at) VALUES (%s, %s, %s, %s, %s, %s, NOW())",
         (client_id, action, actor_kind, actor_user_id, conversation_id, note),
-    )
-
-
-def portal_unavailable(error: Exception, context: str) -> Any:
-    """Log + return the 503 response used by every portal/connector route."""
-    logger.exception("portal storage failure: %s", context)
-    return (
-        {"error": {"code": "portal_unavailable",
-                   "message": "Storage is temporarily unavailable, try again shortly."}},
-        503,
     )

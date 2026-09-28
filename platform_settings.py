@@ -45,7 +45,7 @@ def _ddl() -> str:
 GROUP_KEYS = {
     "email": ["provider", "smtp_host", "smtp_port", "smtp_user",
               "smtp_password", "smtp_from", "brevo_api_key", "reports_to"],
-    "llm": ["base_url", "api_key", "model"],
+    "llm": ["base_url", "api_key", "model", "prices_json"],
     "flags": ["true_sentiment", "kb_autodraft", "phone_verification"],
     "voice": ["provider", "account_sid", "auth_token", "from_number"],
     "video": ["provider", "api_key", "zoom_account_id",
@@ -53,7 +53,15 @@ GROUP_KEYS = {
     "payments": ["provider", "publishable_key", "secret_key",
                  "webhook_secret"],
     "whatsapp_e2e": ["live_number"],
+    "stt": ["api_key", "base_url", "model"],
+    # Platform AI controls (admin AI Control Center): a global pause, the
+    # highest autonomy any workspace may run at, and a per-workspace daily
+    # LLM call cap (0 = unlimited). Env fallbacks: OF_AI_KILL_SWITCH,
+    # OF_AI_AUTONOMY_CAP, OF_AI_DAILY_CALL_CAP.
+    "ai": ["kill_switch", "autonomy_cap", "daily_call_cap"],
 }
+
+AUTONOMY_LEVELS = ("off", "suggest", "auto")
 
 SECRET_HINTS = ("password", "api_key", "token", "secret")
 
@@ -180,6 +188,57 @@ def llm_config() -> dict:
     }
 
 
+def ai_controls() -> dict:
+    """Effective platform AI controls: admin panel first, env fallback.
+
+    {kill_switch: bool, autonomy_cap: off|suggest|auto,
+     daily_call_cap: int (0 = unlimited), source: panel|env|default}
+    Fail-soft: any storage problem yields the permissive defaults. Reads
+    go through get_setting (30 s TTL cache) because the LLM gate consults
+    this on EVERY call - never an extra round trip per call.
+    """
+    stored = {}
+    try:
+        for name in GROUP_KEYS["ai"]:
+            stored[name] = str(get_setting("ai." + name, "") or "")
+    except Exception:
+        stored = {}
+    source = "default"
+    kill_raw = str(stored.get("kill_switch") or "")
+    if kill_raw:
+        source = "panel"
+    else:
+        kill_raw = _env("OF_AI_KILL_SWITCH", "")
+        if kill_raw:
+            source = "env"
+    cap_raw = str(stored.get("autonomy_cap") or "").strip().lower()
+    if cap_raw and source == "default":
+        source = "panel"
+    if not cap_raw:
+        cap_raw = _env("OF_AI_AUTONOMY_CAP", "").lower()
+        if cap_raw and source == "default":
+            source = "env"
+    if cap_raw not in AUTONOMY_LEVELS:
+        cap_raw = "auto"
+    daily_raw = str(stored.get("daily_call_cap") or "").strip()
+    if daily_raw and source == "default":
+        source = "panel"
+    if not daily_raw:
+        daily_raw = _env("OF_AI_DAILY_CALL_CAP", "")
+        if daily_raw and source == "default":
+            source = "env"
+    try:
+        daily_cap = max(0, int(daily_raw or 0))
+    except (TypeError, ValueError):
+        daily_cap = 0
+    return {
+        "kill_switch": kill_raw.strip().lower() in ("on", "1", "true", "yes"),
+        "autonomy_cap": cap_raw,
+        "daily_call_cap": daily_cap,
+        "source": source,
+    }
+
+
 def video_config() -> dict:
     """Effective video-provider config: admin panel first, env fallback."""
     stored = {}
@@ -241,3 +300,24 @@ def flag(name: str) -> bool:
     except Exception:
         return False
     return raw in ("on", "1", "true", "yes")
+
+
+def stt_config() -> dict:
+    """Effective speech-to-text config: admin panel first, env fallback.
+
+    portal_media owns the base/model defaults (OpenAI-compatible whisper
+    endpoint); this only resolves what the owner saved (or the env).
+    """
+    stored = {}
+    try:
+        stored = get_group("stt")
+    except Exception:
+        stored = {}
+    return {
+        "api_key": str(stored.get("api_key")
+                       or _env("OMNIFLOW_STT_API_KEY", "")),
+        "base_url": str(stored.get("base_url")
+                        or _env("OMNIFLOW_STT_BASE", "")),
+        "model": str(stored.get("model")
+                     or _env("OMNIFLOW_STT_MODEL", "")),
+    }
