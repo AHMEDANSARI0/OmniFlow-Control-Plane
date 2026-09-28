@@ -368,14 +368,17 @@ def send_media():
                         int(conversation_id)
                 except (TypeError, ValueError):
                     pass
+            import portal_channels
+
+            channel = portal_channels.channel_for_contact(contact_id)
             cur.execute(
                 "INSERT INTO " + portal_db._q(portal_db.CMD_TABLE) +
                 " (client_id, channel, action, payload, status,"
                 " requested_by, created_at, updated_at) "
-                "VALUES (%s, 'whatsapp', 'send_media',"
+                "VALUES (%s, %s, 'send_media',"
                 " CAST(%s AS JSONB), 'pending', NULL, NOW(), NOW())"
                 " RETURNING id",
-                (client_id, json.dumps(command_payload)),
+                (client_id, channel, json.dumps(command_payload)),
             )
             label = {"image": "Image", "document": "Document",
                      "audio": "Voice note"}.get(
