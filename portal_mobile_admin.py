@@ -422,6 +422,61 @@ def admin_user_detail(user_id: str):
 
 
 # ------------------------------------------------------------------- config
+# ------------------------------------------------------- §280 P5 admin data
+@bp.get("/admin/quality")
+def admin_quality():
+    """AI quality snapshot for the mobile Admin app (session-guarded).
+
+    Reuses admin_ai.overview() - the exact source that feeds the web admin
+    dashboard - so mobile and web never drift. Degrades to a 200 with
+    {"overview": null, "degraded": true} when the CP database is unavailable.
+    """
+    result = _guard()
+    if not isinstance(result, dict):
+        return result
+    try:
+        days = int(request.args.get("days") or 7)
+    except (TypeError, ValueError):
+        days = 7
+    if days not in (1, 7, 14, 30):
+        days = 7
+    try:
+        import admin_ai
+
+        conn = _conn()
+        try:
+            with conn.cursor() as cur:
+                payload = admin_ai.overview(cur, days)
+        finally:
+            conn.close()
+    except Exception as exc:  # fail soft - the app shows a degraded card
+        logger.warning("mobile admin quality failed: %s", exc)
+        return jsonify({"days": days, "overview": None, "degraded": True}), 200
+    return jsonify({"days": days, "overview": payload}), 200
+
+
+@bp.get("/admin/site-stats")
+def admin_site_stats():
+    """Website analytics for the mobile Admin app (session-guarded).
+
+    Reuses portal_site_analytics._stats() - identical numbers to the web
+    admin's site-analytics panel, without exposing the service key route.
+    """
+    result = _guard()
+    if not isinstance(result, dict):
+        return result
+    days = 7
+    try:
+        import portal_site_analytics as psa
+
+        days = psa._clamp_days(request.args.get("days"))
+        payload = psa._run(lambda cur: psa._stats(cur, days))
+    except Exception as exc:  # fail soft - the app shows a degraded card
+        logger.warning("mobile admin site-stats failed: %s", exc)
+        return jsonify({"days": days, "stats": None, "degraded": True}), 200
+    return jsonify({"days": days, "stats": payload}), 200
+
+
 @bp.get("/config")
 def mobile_config():
     """Public config for both mobile apps: flags, versions, maintenance."""
